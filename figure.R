@@ -1,6 +1,6 @@
 # this script is used to analysis and visualize following figures:
 # figures 1-2
-# figures S1-6h
+# figures S1,3-7
 
 # required packages
 library(data.table)
@@ -23,18 +23,15 @@ library(circlize)
 library(patchwork)
 library(linkET)
 library(vegan)
-library(tidyverse)
 library(ggnewscale)
-library(data.table)
 library(irr)
 library(parallel)
 library(ggridges)
-library(dplyr)
-library(patchwork)
 library(GGally)
 library(plotthis)
 library(ggcorrplot)
 library(cowplot)
+library(RColorBrewer)
 
 # set datasets name and colors
 dataset_all<-c("gDNA_MSA","gDNA_EPICv2","gDNA_Galaxy","gDNA_Twist","cfDNA_Galaxy","cfDNA_Twist")
@@ -46,30 +43,33 @@ icc_color<-c("#ef7c8e","#fae8e0","#43b0f1","#a3b7ca")
 depth_color<-c("#b2dfeb","#62bed9","#5da7ba","#578e9b","#4e757e")
 
 #### 1. Method-shared CpGs and clock coverage ####
-# 1.1 shared CpGs by four methods
+# 1.1 shared CpGs by four methods applied in the paper and HM450K
 msa_bed<-fread("data/bed/msa.bed",sep="\t",header=F,data.table = F)
+hm450_bed<-fread("data/bed/hm450.bed",sep="\t",header=F,data.table = F)
 epic2_bed<-fread("data/bed/epic2.bed",sep="\t",header=F,data.table = F)
 galaxy_bed<-fread("data/bed/galaxy.bed",sep="\t",data.table = F)
 twist_bed<-fread("data/bed/twist.bed",sep="\t",data.table = F)
 
 colnames(msa_bed)<-c("chr","start","end","probe")
+colnames(hm450_bed)<-c("chr","start","end","probe")
 colnames(epic2_bed)<-c("chr","start","end","probe")
 colnames(galaxy_bed)<-c("chr","start","end")
 colnames(twist_bed)<-c("chr","start","end")
 
 msa_bed[["pos"]]<-paste0(msa_bed[,1],"_",msa_bed[,2],"_",msa_bed[,3])
+hm450_bed[["pos"]]<-paste0(hm450_bed[,1],"_",hm450_bed[,2],"_",hm450_bed[,3])
 epic2_bed[["pos"]]<-paste0(epic2_bed[,1],"_",epic2_bed[,2],"_",epic2_bed[,3])
 galaxy_bed[["pos"]]<-paste0(galaxy_bed[,1],"_",galaxy_bed[,2],"_",galaxy_bed[,3])
 twist_bed[["pos"]]<-paste0(twist_bed[,1],"_",twist_bed[,2],"_",twist_bed[,3])
 
 tmp_list <- list(
   MSA=msa_bed$pos,
+  HM450K=hm450_bed$pos,
   EPICv2=epic2_bed$pos,
   Galaxy=galaxy_bed$pos,
   Twist=twist_bed$pos
 )
 
-tmp_color<-dataset_color[c(1:4)]
 m <- make_comb_mat(tmp_list)
 cs <- comb_size(m)
 labels<-names(tmp_list)
@@ -93,7 +93,7 @@ ht = draw(UpSet(m,
                     fill = "white",
                     lwd = 2
                   ),width = unit(3, "cm")),
-                bg_col = rev(dataset_color[1:4]),set_order = labels))
+                bg_col = rev(dataset_color[1:5]),set_order = labels))
 od = column_order(ht)
 decorate_annotation("intersection_size", 
                     {grid.text(cs[od], x = seq_along(cs), y = unit(cs[od], "native") + 
@@ -107,25 +107,31 @@ epic2_probe<-fread("data/bed/epic2.bed",sep="\t",header=F,data.table = F)
 galaxy_probe<-fread("data/bed/galaxy_probe.bed",sep="\t",data.table = F)
 twist_probe<-fread("data/bed/twist_probe.bed",sep="\t",data.table = F)
 
-num_cpg_msa<-278401
-num_cpg_epic2<-930146
-num_cpg_galaxy<-3090252
-num_cpg_twist<-3990412
+num_cpg_msa<-nrow(msa_bed)
+num_cpg_epic2<-nrow(epic2_bed)
+num_cpg_galaxy<-nrow(galaxy_bed)
+num_cpg_twist<-nrow(twist_bed)
 
-# clock information
-all_clock<-fread("data/clock_info/epigenetic_clocks.txt",sep="\t",header=T,data.table=F)
-rownames(all_clock)<-all_clock$Clock
+# array clock information
+clock_info<-fread("data/clock_info/epigenetic_clocks.txt",sep="\t",header=T,data.table=F)
+rownames(clock_info)<-clock_info$Clock
+all_clock<-clock_info$Clock
+all_clock<-setdiff(all_clock,"magenet")
 gp_clock<-c("gpage_10","gpage_30","gpage_71","gpage_a","gpage_b","gpage_c")
-pyaging_clock<-setdiff(all_clock$Clock,gp_clock)
-clock_cpg<-fromJSON("data/clock_info/clock_cpg_pyaging.json")
+pyaging_clock<-setdiff(all_clock[1:53],gp_clock)
+clock_cpg<-fromJSON("data/clock_info/all_clock.cpg-dump.json")
 
 # clock coverage by reference
 clock_coverage_ref<-data.frame()
-for (clock in all_clock$Clock){
+for (clock in all_clock){
   if (clock %in% pyaging_clock){tmp_clock_cpg<-clock_cpg[clock][[1]]}else{
     tmp_clock_cpg<-fread(paste0("data/clock_info/",clock,".txt"),sep="\t",header=F,data.table = F)$V1
   }
   num_cpg<-length(tmp_clock_cpg)
+  if (clock %in% c("timeseqage","bsclock","komakiage")){
+    tmp_clock_pos<-fread(paste0("data/clock_info/",clock,".bed"),sep="\t",header=F,data.table = F)
+    num_cpg<-nrow(tmp_clock_pos)
+  }
   if ("female" %in% tmp_clock_cpg){num_cpg<-num_cpg-1}
   if ("age" %in% tmp_clock_cpg){num_cpg<-num_cpg-1}
   clock_msa<-intersect(tmp_clock_cpg,msa_probe[,4])
@@ -138,10 +144,18 @@ for (clock in all_clock$Clock){
   
   clock_galaxy<-intersect(tmp_clock_cpg,galaxy_probe[,4])
   covered_cpg_galaxy<-length(clock_galaxy)
+  if (clock %in% c("timeseqage","bsclock","komakiage")){
+    tmp_clock_pos<-fread(paste0("data/clock_info/",clock,"_galaxy.txt"),sep="\t",header=F,data.table = F)
+    covered_cpg_galaxy<-nrow(tmp_clock_pos)
+  }
   percent_covered_galaxy<-100*covered_cpg_galaxy/num_cpg
   
   clock_twist<-intersect(tmp_clock_cpg,twist_probe[,4])
   covered_cpg_twist<-length(clock_twist)
+  if (clock %in% c("timeseqage","bsclock","komakiage")){
+    tmp_clock_pos<-fread(paste0("data/clock_info/",clock,"_twist.txt"),sep="\t",header=F,data.table = F)
+    covered_cpg_twist<-nrow(tmp_clock_pos)
+  }
   percent_covered_twist<-100*covered_cpg_twist/num_cpg
   
   tmp<-c(percent_covered_msa,percent_covered_epic2,percent_covered_galaxy,percent_covered_twist)
@@ -150,9 +164,9 @@ for (clock in all_clock$Clock){
   if (nrow(clock_coverage_ref)==0){clock_coverage_ref<-tmp}else{clock_coverage_ref<-rbind(clock_coverage_ref,tmp)}
 }
 clock_coverage_ref<-apply(clock_coverage_ref,2,as.numeric)
-rownames(clock_coverage_ref)<-all_clock$Clock
+rownames(clock_coverage_ref)<-all_clock
 
-# clock coverage by observation
+# clock coverage by observation (53 array clocks)
 clock_coverage_obs<-data.frame()
 for (i in c(1:6)){
   if (i<3){
@@ -169,7 +183,7 @@ for (i in c(1:6)){
     num_cpg_mean<-round(mean(num_cpg_mean),digits = 0)
   }
   clock_coverage_dataset<-data.frame()
-  for (clock in all_clock$Clock){
+  for (clock in all_clock[1:53]){
     if (clock %in% pyaging_clock){tmp_clock_cpg<-clock_cpg[clock][[1]]}else{
       tmp_clock_cpg<-fread(paste0("data/clock_info/",clock,".txt"),sep="\t",header=F,data.table = F)$V1
     }
@@ -199,7 +213,92 @@ for (i in c(1:6)){
 clock_coverage_obs<-clock_coverage_obs[,-1]
 clock_coverage_obs<-apply(clock_coverage_obs,2,as.numeric)
 colnames(clock_coverage_obs)<-dataset_all
-rownames(clock_coverage_obs)<-all_clock$Clock
+rownames(clock_coverage_obs)<-all_clock[1:53]
+
+# clock coverage by observation (4 sequencing clocks)
+{
+clock_coverage_tmp<-data.frame()
+clock<-"emseqage"
+for (i in c(1:6)){
+  if (i<3){
+    methy_matrix_tmp<-fread(paste0("data/matrix/",dataset_all[i],"_methy_matrix.txt.gz"),sep="\t",data.table=F)
+    rownames(methy_matrix_tmp)<-methy_matrix_tmp[,1]
+    methy_matrix_tmp<-methy_matrix_tmp[,-1]
+    num_cpg_mean <-apply(methy_matrix_tmp, 2, function(x) sum(!is.na(x), na.rm = TRUE))
+    num_cpg_mean<-round(mean(num_cpg_mean),digits = 0)
+  }else{
+    methy_matrix_tmp<-fread(paste0("data/matrix/",dataset_all[i],"_depth_matrix.txt.gz"),sep="\t",data.table=F)
+    rownames(methy_matrix_tmp)<-methy_matrix_tmp[,1]
+    methy_matrix_tmp<-methy_matrix_tmp[,-1]
+    num_cpg_mean <-apply(methy_matrix_tmp, 2, function(x) sum(!is.na(x) & x > 4, na.rm = TRUE))
+    num_cpg_mean<-round(mean(num_cpg_mean),digits = 0)
+  }
+  clock_coverage_dataset<-data.frame()
+  tmp_clock_cpg<-fread("data/clock_info/emseqage.txt",sep="\t",header=F,data.table = F)
+  tmp_clock_cpg<-tmp_clock_cpg$V1
+  num_cpg<-length(tmp_clock_cpg)
+  methy_matrix_cpg<-methy_matrix_tmp[rownames(methy_matrix_tmp)%in%tmp_clock_cpg,]
+  if (i<3){
+    cover_cpg_mean <-apply(methy_matrix_cpg, 2, function(x) sum(!is.na(x), na.rm = TRUE))
+  }else{
+    cover_cpg_mean <-apply(methy_matrix_cpg, 2, function(x) sum(!is.na(x) & x > 4, na.rm = TRUE))
+  }
+  cover_cpg_mean<-round(mean(cover_cpg_mean),digits = 0)
+  percent_cover<-100*cover_cpg_mean/num_cpg
+  tmp<-c(clock,percent_cover)
+  tmp<-t(data.frame(tmp))
+  colnames(tmp)<-c("clock",dataset_all[i])
+  if (nrow(clock_coverage_dataset)==0){clock_coverage_dataset=tmp}else{clock_coverage_dataset<-rbind(clock_coverage_dataset,tmp)}
+  rownames(clock_coverage_dataset)<-clock_coverage_dataset[,1]
+  if (nrow(clock_coverage_tmp)==0){clock_coverage_tmp<-clock_coverage_dataset
+  }else{
+    clock_coverage_tmp<-cbind(clock_coverage_tmp,clock_coverage_dataset[,2])}
+}
+clock_cpg_num<-data.frame(clock=c("timeseqage","bsclock","komakiage"),num=c(405,4527,235))
+for (clock in c("timeseqage","bsclock","komakiage")){
+clock_coverage_dataset<-data.frame()
+for (i in c(1:6)){
+  if (i<3){
+    methy_matrix_tmp<-fread(paste0("data/matrix/",dataset_all[i],"_methy_matrix.txt.gz"),sep="\t",data.table=F)
+    rownames(methy_matrix_tmp)<-methy_matrix_tmp[,1]
+    methy_matrix_tmp<-methy_matrix_tmp[,-1]
+    num_cpg_mean <-apply(methy_matrix_tmp, 2, function(x) sum(!is.na(x), na.rm = TRUE))
+    num_cpg_mean<-round(mean(num_cpg_mean),digits = 0)
+    
+    tmp_clock_cpg<-fread(paste0("/mnt/md128/huangwl/ref/Clocks/",clock,"_probe.txt"),sep="\t",header=F,data.table = F)$V7
+    num_cpg<-length(tmp_clock_cpg)
+    methy_matrix_cpg<-methy_matrix_tmp[rownames(methy_matrix_tmp)%in%tmp_clock_cpg,]
+    
+  }else{
+    methy_matrix_tmp<-fread(paste0("/mnt/md128/huangwl/project/mtAge/data/",dataset_all[i],"/processed/matrix/",dataset_all[i],"_depth_",clock,".matrix"),sep="\t",data.table=F)
+    methy_matrix_tmp<-methy_matrix_tmp[,4:ncol(methy_matrix_tmp)]
+    num_cpg_mean <-apply(methy_matrix_tmp, 2, function(x) sum(!is.na(x) & x > 4, na.rm = TRUE))
+    num_cpg_mean<-round(mean(num_cpg_mean),digits = 0)
+  }
+  if (i<3){
+    cover_cpg_mean <-apply(methy_matrix_cpg, 2, function(x) sum(!is.na(x), na.rm = TRUE))
+  }else{
+    cover_cpg_mean <-num_cpg_mean
+  }
+  cover_cpg_mean<-round(mean(cover_cpg_mean),digits = 0)
+  num_cpg<-clock_cpg_num[clock_cpg_num$clock==clock,"num"]
+  percent_cover<-100*cover_cpg_mean/num_cpg
+  tmp<-c(clock,percent_cover)
+  tmp<-t(data.frame(tmp))
+  colnames(tmp)<-c("clock",dataset_all[i])
+  if (nrow(clock_coverage_dataset)==0){clock_coverage_dataset=tmp}else{clock_coverage_dataset<-cbind(clock_coverage_dataset,tmp[,2])}
+}
+clock_coverage_tmp<-rbind(clock_coverage_tmp,clock_coverage_dataset)
+}
+rownames(clock_coverage_tmp)<-clock_coverage_tmp[,1]
+clock_coverage_tmp<-clock_coverage_tmp[,-1]
+clock_coverage_tmp<-apply(clock_coverage_tmp,2,as.numeric)
+colnames(clock_coverage_tmp)<-dataset_all
+rownames(clock_coverage_tmp)<-c("emseqage","timeseqage","bsclock","komakiage")
+}
+
+clock_coverage_obs<-rbind(clock_coverage_obs,clock_coverage_tmp)
+write.table(clock_coverage_obs,"./data/clock_info/clock_coverage_obs.txt",sep="\t",row.names=T,col.names=T,quote=F)
 
 # combined and plot
 clock_coverage_all<-cbind(clock_coverage_ref,clock_coverage_obs)
@@ -213,10 +312,10 @@ annotation_col <- data.frame(Type=factor(c("Datasheet","Observation",
 levels(annotation_col$Type)<-c("Reference","Observation")
 rownames(annotation_col)<-colnames(clock_coverage_all)
 colnames(annotation_col)<-"Coverage Calc. By"
-annotation_row<-clock_info[,c("Generation/Prediction","Category")]
+annotation_row<-clock_info[all_clock,c("Generation/Prediction","Category")]
 annotation_colors <- list("Coverage Calc. By" = c(Reference = "#d6eadf", Observation = "#eac4d5"),
                           "Category"=c("Hi-Cov-All"="#244CBC","Hi-Repro"="#CB232A",
-                                       "Hi-Cov-nonMSA"="#5DB9DD",Other="#C2C4C6"),
+                                       "Hi-Cov-nonMSA"="#5DB9DD","Other"="#C2C4C6","Sequencing-Clock"="#096377"),
                           "Generation/Prediction"=c(First="#fbf2c4",Second="#F5DE24",Third="#AECE34",
                                                     Fourth="#00743F",Gestational="#F6C3DB",Other="#3D3D3D"))
 pdf("figure/fig_S1b.pdf",width=7,height = 8,onefile = F)
@@ -513,10 +612,10 @@ p<- qcorrplot(correlate(methy_matrix_mean), type = "lower",grid_col = NA) +
         legend.title = element_text(size=22),
         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0)
   )
-ggsave("figure/fig_S1i.pdf",plot=p,width = 8,heigh=6)
+ggsave("figure/fig_S1h.pdf",plot=p,width = 8,heigh=6)
 
 #### 3. ICC calculated by beta values or predicted age ####
-# 3.1 ICC of CpGs (fig_1d, fig_S1i were ploted using python )
+# 3.1 ICC of CpGs
 calculate_icc<- function(input_data) {
   rep1 <- as.numeric(input_data[1:24])
   rep2 <- as.numeric(input_data[25:48])
@@ -565,15 +664,24 @@ cpg_icc$Group <- cut(
 )
 cpg_icc<-na.omit(cpg_icc)
 write.table(cpg_icc,"result/cpg_icc.txt",sep="\t",row.names = F,col.names = T,quote=F)
+cpg_icc<-fread("result/cpg_icc.txt",sep="\t",header=T,data.table=F)
 
-# 3.2 ICC of predicted age (fig_1h was ploted using python)
+# 3.2 ICC of predicted age
 cl <- makeCluster(8)
 clusterExport(cl, c("icc", "calculate_icc"))
 age_icc<-data.frame()
 for (i in c(1:6)){
   pred_age_tmp<-fread(paste0("result/",dataset_all[i],"_predicted_age.txt"),sep="\t",data.table=F)
   rownames(pred_age_tmp)<-pred_age_tmp$Name
-  pred_age_tmp<-pred_age_tmp[,all_clock$Clock]
+  pred_age_emseqage<-fread(paste0("result/",dataset_all[i],"/",dataset_all[i],"_predicted_age_emseqage.txt"),sep="\t",header=T,data.table=F)
+  rownames(pred_age_emseqage)<-pred_age_emseqage[,1]
+  pred_age_emseqage<-pred_age_emseqage[rownames(pred_age_tmp),]
+  pred_age_tmp[["emseqage"]]<-pred_age_emseqage$Predicted_Age
+  pred_age_timeseqage<-fread(paste0("result/",dataset_all[i],"/",dataset_all[i],"_predicted_age_timeseqage.txt"),sep="\t",header=T,data.table=F)
+  rownames(pred_age_timeseqage)<-pred_age_timeseqage[,1]
+  pred_age_timeseqage<-pred_age_timeseqage[rownames(pred_age_tmp),]
+  pred_age_tmp[["timeseqage"]]<-pred_age_timeseqage$Predicted_Age
+  pred_age_tmp<-pred_age_tmp[,all_clock[1:55]]
   pred_age_tmp<-t(pred_age_tmp)
   icc_values <- parApply(cl, pred_age_tmp, 1, calculate_icc)
   result_tmp <- as.data.frame(do.call(rbind, icc_values))
@@ -591,14 +699,14 @@ age_icc$Group <- cut(
   include.lowest = TRUE
 )
 age_icc<-na.omit(age_icc)
-write.table(cpg_icc,"result/age_icc.txt",sep="\t",row.names = F,col.names = T,quote=F)
+write.table(age_icc,"result/age_icc.txt",sep="\t",row.names = F,col.names = T,quote=F)
 
 # fig_1g
-age_icc$Model<-factor(age_icc$Model,levels=rev(unique(age_icc$Model)))
+age_icc$Clock<-factor(age_icc$Clock,levels=rev(unique(age_icc$Clock)))
 age_icc$Dataset<-factor(age_icc$Dataset,levels=dataset_all)
 age_icc[["Group2"]]<-factor(age_icc$Group,levels=unique(age_icc$Group))
 levels(age_icc$Group2)<-rev(c("Poor","Moderate","Good","Excellent"))
-p <- ggplot(age_icc, aes(y = Model, x = ICC)) +
+p <- ggplot(age_icc, aes(y = Clock, x = ICC)) +
   geom_point(aes(fill=Group2),color="black",pch=21,size = 3,alpha=0.7) +
   geom_errorbarh(aes(color=Group2,xmin = CI_lower, xmax = CI_upper), height = 0.2) +
   geom_vline(xintercept = c(0.5, 0.75, 0.9), linetype = "dashed", color = "gray60") +
@@ -625,236 +733,20 @@ p <- ggplot(age_icc, aes(y = Model, x = ICC)) +
 
 ggsave("figure/fig_1g.pdf",plot=p,width = 16.2,heigh=16)
 
-# 3.3 scatter plot of beta values between replicates with ICC (fig_S1g)
-# focus on clock-shared CpGs
-probe_icc<-probe_icc[probe_icc$CpG%in%clock_cpg_all,]
-probe_icc$ICC[probe_icc$ICC<0]<-0
-rep_icc<-data.frame()
-for (i in c(1:6)){
-  methy_matrix_tmp<-fread(paste0("data/",dataset_all[i],"_methy_matrix.txt.gz"),sep="\t",data.table=F)
-  rownames(methy_matrix_tmp)<-methy_matrix_tmp[,1]
-  methy_matrix_tmp<-methy_matrix_tmp[,-1]
-  tmp_icc<-probe_icc[probe_icc$Dataset==dataset_all[i],]
-  for (cpg in tmp_icc$CpG){
-    methy_cpg<-methy_matrix_tmp[cpg,]
-    value_icc<-tmp_icc[tmp_icc$CpG==cpg,"ICC"]
-    result_tmp<-data.frame("Rep1"=t(methy_cpg)[1:24,1],"Rep2"=t(methy_cpg)[25:48,1])
-    result_tmp[["ICC"]]<-rep(value_icc,24)
-    result_tmp[["Dataset"]]<-rep(dataset_all[i],24)
-    if (nrow(rep_icc)==0){rep_icc=result_tmp}else{rep_icc<-rbind(rep_icc,result_tmp)}
-  }
-}
-rep_icc$Dataset<-factor(rep_icc$Dataset,levels=unique(rep_icc$Dataset))
-
-p<-ggplot(rep_icc,aes(x=Rep1,y=Rep2))+
-  geom_point(aes(fill=ICC),color="black",pch=21,size = 2,alpha=0.7) +
-  scale_fill_gradient2(low="#3498db",mid="#b6e2f9",high="#ffd600",midpoint = 0.5,
-                       limits = c(0, 1),breaks = seq(0, 1, 0.25),oob = scales::squish)+
-  labs(x = "Rep1",y = "Rep2", title = "",fill="ICC") +
-  theme_bw()+
-  theme( panel.grid.minor = element_blank(),
-         panel.grid.major = element_blank(),
-         # panel.border = element_blank(),
-         # axis.line = element_line(),
-         strip.background = element_rect(fill="white"),
-         strip.text = element_text(size=22,face="bold"),
-         axis.title = element_text(size = 22),
-         axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
-         axis.text.y = element_text(size = 22, color = "black"),
-         axis.ticks = element_line(color = "black"),
-         legend.text = element_text(size = 22, color = "black"),
-         legend.title = element_text(size = 22, color = "black"),
-         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
-  facet_wrap(~Dataset,nrow=2)
-ggsave("figure/fig_S1g.png",plot=p,width = 20,heigh=12,dpi=300)
-
-# 3.4 mean/sd/icc correlation
-p1<-ggplot(probe_icc,aes(x=Mean,y=SD))+
-  geom_point(aes(fill=ICC),color="black",pch=21,size = 3,alpha=0.7) +
-  scale_fill_gradient2(low="#3498db",mid="#b6e2f9",high="#ffd600",midpoint = 0.5,
-                       limits = c(0, 1),breaks = seq(0, 1, 0.25),oob = scales::squish)+
-  labs(x = "Mean",y = "SD", title = "",fill="ICC") +
-  theme_bw()+
-  theme( panel.grid.minor = element_blank(),
-         panel.grid.major = element_blank(),
-         strip.background = element_rect(fill="white"),
-         strip.text = element_text(size=22,face="bold"),
-         axis.title = element_text(size = 22),
-         axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
-         axis.text.y = element_text(size = 22, color = "black"),
-         axis.ticks = element_line(color = "black"),
-         legend.text = element_text(size = 22, color = "black"),
-         legend.title = element_text(size = 22, color = "black"),
-         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
-  facet_wrap(~Dataset,nrow=1)
-
-p2<-ggplot(probe_icc,aes(x=SD,y=ICC))+
-  geom_point(aes(fill=ICC),color="black",pch=21,size = 3,alpha=0.7) +
-  scale_fill_gradient2(low="#3498db",mid="#b6e2f9",high="#ffd600",midpoint = 0.5,
-                       limits = c(0, 1),breaks = seq(0, 1, 0.25),oob = scales::squish)+
-  labs(x = "SD",y = "ICC", title = "",fill="ICC") +
-  theme_bw()+
-  theme( panel.grid.minor = element_blank(),
-         panel.grid.major = element_blank(),
-         strip.background = element_blank(),
-         strip.text = element_blank(),
-         axis.title = element_text(size = 22),
-         axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
-         axis.text.y = element_text(size = 22, color = "black"),
-         axis.ticks = element_line(color = "black"),
-         legend.text = element_text(size = 22, color = "black"),
-         legend.title = element_text(size = 22, color = "black"),
-         legend.position = "right",
-         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
-  facet_wrap(~Dataset,nrow=1)
-
-p3<-ggplot(probe_icc,aes(x=Group2,y=Mean))+
-  geom_violin(aes(fill = Group2),color="black",
-              width=0.8,position = position_dodge(0.5))+
-  scale_fill_manual(values=icc_color) +
-  labs(x = "ICC",y = "Mean", title = "",fill="") +
-  theme_bw()+
-  theme( panel.grid.minor = element_blank(),
-         panel.grid.major = element_blank(),
-         strip.background = element_blank(),
-         strip.text = element_blank(),
-         axis.title = element_text(size = 22),
-         axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
-         axis.text.y = element_text(size = 22, color = "black"),
-         axis.ticks = element_line(color = "black"),
-         legend.text = element_text(size = 22, color = "black"),
-         legend.title = element_text(size = 22, color = "black"),
-         legend.position = "null",
-         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
-  facet_wrap(~Dataset,nrow=1)
-
-p4<-ggplot(probe_icc,aes(x=Group2,y=SD))+
-  geom_boxplot(aes(fill = Group2),color="black",
-               width=0.8,position = position_dodge(0.5),outlier.shape = NA)+
-  scale_fill_manual(values=icc_color) +
-  labs(x = "ICC",y = "SD", title = "") +
-  theme_bw()+
-  theme( panel.grid.minor = element_blank(),
-         panel.grid.major = element_blank(),
-         strip.background = element_blank(),
-         strip.text = element_blank(),
-         axis.title = element_text(size = 22),
-         axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
-         axis.text.y = element_text(size = 22, color = "black"),
-         axis.ticks = element_line(color = "black"),
-         legend.text = element_text(size = 22, color = "black"),
-         legend.title = element_text(size = 22, color = "black"),
-         legend.position = "null",
-         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
-  facet_wrap(~Dataset,nrow=1)
-
-p<-p1/p2/p3/p4
-ggsave("figure/fig_S2a-d.pdf",plot=p,width = 30,heigh=24)
-
-# 3.5 mean/sd/icc depth filtering
-# CpGs were filtered by various depths
-cl <- makeCluster(8)
-clusterExport(cl, c("icc", "calculate_icc"))
-depth_icc<-data.frame()
-for (depth in c(1,5,10,15,20)){
-  for (i in c(3:6)){
-    depth_matrix_tmp<-fread(paste0("data/",dataset_all[i],"_depth_matrix.txt.gz"),sep="\t",data.table=F)
-    rownames(depth_matrix_tmp)<-depth_matrix_tmp[,1]
-    depth_matrix_tmp<-depth_matrix_tmp[,-1]
-    depth_matrix_tmp[["minDepth"]]<-apply(depth_matrix_tmp,1,min)
-    depth_matrix_tmp<-depth_matrix_tmp[depth_matrix_tmp$minDepth>=depth,]
-    methy_matrix_tmp<-fread(paste0("data/",dataset_all[i],"_methy_matrix.txt.gz"),sep="\t",data.table=F)
-    rownames(methy_matrix_tmp)<-methy_matrix_tmp[,1]
-    methy_matrix_tmp<-methy_matrix_tmp[,-1]
-    methy_matrix_tmp<-methy_matrix_tmp[rownames(depth_matrix_tmp),]
-    
-    icc_values <- parApply(cl, methy_matrix_tmp, 1, calculate_icc)
-    result_tmp <- as.data.frame(do.call(rbind, icc_values))
-    result_tmp<-apply(result_tmp, 2, as.numeric)
-    result_tmp<-data.frame(result_tmp)
-    result_tmp[["CpG"]]<-rownames(methy_matrix_tmp)
-    result_tmp[["Dataset"]]<-rep(dataset_level[i],nrow(methy_matrix_tmp))
-    result_tmp[["Depth"]]<-rep(paste0("Depth",depth),nrow(methy_matrix_tmp))
-    if (nrow(depth_icc)==0){depth_icc<-result_tmp}else{depth_icc<-rbind(depth_icc,result_tmp)}
-  }
-}
-stopCluster(cl)
-depth_icc$Group <- cut(
-  depth_icc$ICC,
-  breaks = c(-Inf, 0.5, 0.75, 0.9, Inf),
-  labels = c("Poor(<0.5)", "Moderate(0.5-0.75)", "Good(0.75-0.9)", "Excellent(≥0.9)"),
-  include.lowest = TRUE
-)
-depth_icc<-na.omit(depth_icc)
-depth_icc$Dataset<-factor(depth_icc$Dataset,levels=unique(depth_icc$Dataset))
-depth_icc$Depth<-factor(depth_icc$Depth,levels=unique(depth_icc$Depth))
-
-p1<-ggplot(depth_icc, aes(x = Depth, y = Mean, fill = Depth)) +
-  geom_boxplot(outlier.shape = NA) +
-  scale_fill_manual(name="Depth",values = depth_color)+
-  labs(title = "",x = "",y = "Mean")+
-  theme_bw() +
-  theme( panel.grid.minor = element_blank(),
-         panel.grid.major = element_blank(),
-         strip.background = element_rect(fill="white"),
-         strip.text = element_text(size=22,face="bold"),
-         axis.title = element_text(size = 22),
-         axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
-         axis.text.y = element_text(size = 22, color = "black"),
-         axis.ticks = element_line(color = "black"),
-         legend.text = element_text(size = 22, color = "black"),
-         legend.title = element_text(size = 22, color = "black"),
-         legend.position = "null",
-         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
-  facet_wrap(~Dataset,nrow=1)
-
-p2<-ggplot(depth_icc, aes(x = Depth, y = SD, fill = Depth)) +
-  geom_boxplot(outlier.shape = NA) +
-  scale_fill_manual(name="Depth",values = depth_color)+
-  labs(title = "",x = "",y = "SD")+
-  theme_bw() +
-  theme( panel.grid.minor = element_blank(),
-         panel.grid.major = element_blank(),
-         strip.background = element_rect(fill="white"),
-         strip.text = element_text(size=22,face="bold"),
-         axis.title = element_text(size = 22),
-         axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
-         axis.text.y = element_text(size = 22, color = "black"),
-         axis.ticks = element_line(color = "black"),
-         legend.text = element_text(size = 22, color = "black"),
-         legend.title = element_text(size = 22, color = "black"),
-         legend.position = "null",
-         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
-  facet_wrap(~Dataset,nrow=1)
-p<-p1/p2
-ggsave("figure/fig_S2e-f.pdf",plot=p,width = 24,heigh=12)
-
-p<-ggplot(depth_icc, aes(x = Depth, y = ICC)) +
-  geom_violin(aes(fill=Depth))+
-  geom_boxplot(fill="white",width = 0.3,outlier.shape = NA) +
-  scale_fill_manual(name="Depth",values = depth_color)+
-  labs(title = "",x = "",y = "ICC")+
-  theme_bw() +
-  theme( panel.grid.minor = element_blank(),
-         panel.grid.major = element_blank(),
-         strip.background = element_rect(fill="white"),
-         strip.text = element_text(size=22,face="bold"),
-         axis.title = element_text(size = 22),
-         axis.text.x = element_text(angle = 45, size = 22, color = "black", hjust = 0.5, vjust = 0.5),
-         axis.text.y = element_text(size = 22, color = "black"),
-         axis.ticks = element_line(color = "black"),
-         legend.text = element_text(size = 22, color = "black"),
-         legend.title = element_text(size = 22, color = "black"),
-         legend.position = "null",
-         plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
-  facet_wrap(~Dataset,nrow=2)
-ggsave("figure/fig_1e.pdf",plot=p,width = 10,heigh=12)
-
 #### 4. Predicted age related analysis ####
 # 4.1 consistency
 pred_age_all<-data.frame()
 for (i in c(1:6)){
   pred_age_tmp<-fread(paste0("result/",dataset_all[i],"_predicted_age.txt"),sep="\t",data.table=F)
+  rownames(pred_age_tmp)<-pred_age_tmp$Name
+  pred_age_emseqage<-fread(paste0("result/",dataset_all[i],"/",dataset_all[i],"_predicted_age_emseqage.txt"),sep="\t",header=T,data.table=F)
+  rownames(pred_age_emseqage)<-pred_age_emseqage[,1]
+  pred_age_emseqage<-pred_age_emseqage[rownames(pred_age_tmp),]
+  pred_age_tmp[["emseqage"]]<-pred_age_emseqage$Predicted_Age
+  pred_age_timeseqage<-fread(paste0("result/",dataset_all[i],"/",dataset_all[i],"_predicted_age_timeseqage.txt"),sep="\t",header=T,data.table=F)
+  rownames(pred_age_timeseqage)<-pred_age_timeseqage[,1]
+  pred_age_timeseqage<-pred_age_timeseqage[rownames(pred_age_tmp),]
+  pred_age_tmp[["timeseqage"]]<-pred_age_timeseqage$Predicted_Age
   if (nrow(pred_age_all)==0){pred_age_all<-pred_age_tmp}else{pred_age_all<-rbind(pred_age_all,pred_age_tmp)}
 }
 rownames(pred_age_all)<-pred_age_all$Name
@@ -900,11 +792,11 @@ for (i in c(1:length(all_category))){
 }
 combined_plot<-combined_plot+
   plot_layout(nrow = 1, ncol = 3,guides = "collect")
-ggsave("figure/fig_1i.pdf",plot=combined_plot,width = 24,heigh=6)
+ggsave("figure/fig_1h.pdf",plot=combined_plot,width = 24,heigh=6)
 
 # for each clock
 j=0
-for (i in c(1:length(rownames(clock_info)))){
+for (i in c(1:55)){
   clock<-rownames(clock_info)[i]
   methy_matrix_mean<-pred_age_all[,clock]
   names(methy_matrix_mean)<-sample_info_all$Name
@@ -949,7 +841,7 @@ combined_plot<-combined_plot+
 ggsave("figure/fig_S5.pdf",plot=combined_plot,width = 40,heigh=24)
 
 # 4.2 RD/Metrics scatter of Hi-Repro clocks
-hi_repro_clock<-all_clock[all_clock$Category=="Hi-Repro","Clock"]
+hi_repro_clock<-clock_info[clock_info$Category=="Hi-Repro","Clock"]
 for (i in c(1:6)){
   pred_age_tmp<-fread(paste0("result/",dataset_all[i],"_predicted_age.txt"),sep="\t",data.table=F)
  
@@ -1057,7 +949,7 @@ for (i in c(1:6)){
   if (i==1){plot_result1<-plot_dataset1}else(plot_result1<-plot_result1/plot_dataset1)
   plot_result1<-plot_result1+plot_layout(heights = c(1, 1, 1, 1, 1, 1))&
     theme(plot.margin = margin(10, 10, 10, 10, "pt"))
-  ggsave("figure/fig_S6b.pdf", plot_result1, width = 30, height = 30)
+  ggsave("figure/fig_S7.pdf", plot_result1, width = 30, height = 30)
 }
 
 # 4.3 boxplot of RD for all clocks
@@ -1065,10 +957,18 @@ rep_diff_all<-data.frame()
 for (i in c(1:6)){
   pred_age_tmp<-fread(paste0("result/",dataset_all[i],"_predicted_age.txt"),sep="\t",data.table=F)
   rownames(pred_age_tmp)<-pred_age_tmp$Name
+  pred_age_emseqage<-fread(paste0("result/",dataset_all[i],"/",dataset_all[i],"_predicted_age_emseqage.txt"),sep="\t",header=T,data.table=F)
+  rownames(pred_age_emseqage)<-pred_age_emseqage[,1]
+  pred_age_emseqage<-pred_age_emseqage[rownames(pred_age_tmp),]
+  pred_age_tmp[["emseqage"]]<-pred_age_emseqage$Predicted_Age
+  pred_age_timeseqage<-fread(paste0("result/",dataset_all[i],"/",dataset_all[i],"_predicted_age_timeseqage.txt"),sep="\t",header=T,data.table=F)
+  rownames(pred_age_timeseqage)<-pred_age_timeseqage[,1]
+  pred_age_timeseqage<-pred_age_timeseqage[rownames(pred_age_tmp),]
+  pred_age_tmp[["timeseqage"]]<-pred_age_timeseqage$Predicted_Age
   pred_age_rep1<-pred_age_tmp[1:24,] %>%
-    pivot_longer(cols =all_clock$Clock, names_to = "clock", values_to = "rep1")
+    pivot_longer(cols =clock_info$Clock[1:55], names_to = "clock", values_to = "rep1")
   pred_age_rep2<-pred_age_tmp[25:48,] %>%
-    pivot_longer(cols =all_clock$Clock, names_to = "clock", values_to = "rep2")
+    pivot_longer(cols =clock_info$Clock[1:55], names_to = "clock", values_to = "rep2")
   rep_diff_tmp<-data.frame(pred_age_rep1,pred_age_rep2[,"rep2"])
   rep_diff_tmp[["diff"]]<-abs(rep_diff_tmp$rep2-rep_diff_tmp$rep1)
   rep_diff_tmp[["dataset"]]<-rep(dataset_all[i],nrow(rep_diff_tmp))
@@ -1077,7 +977,7 @@ for (i in c(1:6)){
 rep_diff_all<-na.omit(rep_diff_all)
 
 # Hi-Repro
-rep_diff<-rep_diff_all[rep_diff_all$clock%in%all_clock[all_clock$Category=="Hi-Repro","Clock"],]
+rep_diff<-rep_diff_all[rep_diff_all$clock%in%clock_info[clock_info$Category=="Hi-Repro","Clock"],]
 rep_diff$clock<-factor(rep_diff$clock,levels=rev(unique(rep_diff$clock)))
 rep_diff$dataset<-factor(rep_diff$dataset,levels=dataset_all)
 p<-ggplot(rep_diff, aes(x = diff, y = clock)) +
@@ -1097,6 +997,13 @@ p<-ggplot(rep_diff, aes(x = diff, y = clock)) +
     plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
   facet_wrap(~dataset,nrow=1)
 ggsave("figure/fig_S4a.pdf",plot=p,width = 16,heigh=5)
+
+tmp <- rep_diff %>%
+  group_by(dataset, clock) %>%
+  summarise(
+    median_value = median(diff, na.rm = TRUE),
+    .groups = "drop"
+  )
 
 # Hi-Cov-All
 rep_diff<-rep_diff_all[rep_diff_all$clock%in%all_clock[all_clock$Category=="Hi-Cov-All","Clock"],]
@@ -1144,6 +1051,29 @@ p<-ggplot(rep_diff, aes(x = diff, y = clock)) +
   facet_wrap(~dataset,nrow=1)
 ggsave("figure/fig_S4c.pdf",plot=p,width = 16,heigh=8)
 
+# Sequencing−Clock
+rep_diff<-rep_diff_all[rep_diff_all$clock%in%sequence_clock,]
+rep_diff$clock<-factor(rep_diff$clock,levels=rev(unique(rep_diff$clock)))
+rep_diff$dataset<-factor(rep_diff$dataset,levels=dataset_all)
+p<-ggplot(rep_diff, aes(x = diff, y = clock)) +
+  geom_boxplot(color="#096377",fill="#096377",alpha=0.3)+
+  scale_fill_manual(name="Model",values = rev(model_color))+
+  labs(title = "Sequencing−Clock",x = "Replicate Difference",y = NULL)+
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill="white"),
+    strip.text = element_text(size=22,face="bold"),
+    axis.title = element_text(size = 22),
+    axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
+    axis.text.y = element_text(size = 22, color = "black"),
+    axis.ticks = element_line(color = "black"),
+    legend.text = element_text(size = 22, color = "black"),
+    legend.title = element_text(size = 22, color = "black"),
+    legend.position = "null",
+    plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
+  facet_wrap(~dataset,nrow=1)
+ggsave("figure/fig_S4d.pdf",plot=p,width = 16,heigh=3)
+
 # 4.4 R and MAE plot
 calculate_metrics <- function(pred_age,clock_use) {
   metrics <- matrix(nrow = length(clock_use), ncol = 4)
@@ -1167,18 +1097,28 @@ metrics_all<-data.frame()
 for (i in c(1:6)){
   pred_age_tmp<-fread(paste0("result/",dataset_all[i],"_predicted_age.txt"),sep="\t",data.table=F)
   rownames(pred_age_tmp)<-pred_age_tmp$Name
+  
+  pred_age_emseqage<-fread(paste0("result/",dataset_all[i],"/",dataset_all[i],"_predicted_age_emseqage.txt"),sep="\t",header=T,data.table=F)
+  rownames(pred_age_emseqage)<-pred_age_emseqage[,1]
+  pred_age_emseqage<-pred_age_emseqage[rownames(pred_age_tmp),]
+  pred_age_tmp[["emseqage"]]<-pred_age_emseqage$Predicted_Age
+  pred_age_timeseqage<-fread(paste0("result/",dataset_all[i],"/",dataset_all[i],"_predicted_age_timeseqage.txt"),sep="\t",header=T,data.table=F)
+  rownames(pred_age_timeseqage)<-pred_age_timeseqage[,1]
+  pred_age_timeseqage<-pred_age_timeseqage[rownames(pred_age_tmp),]
+  pred_age_tmp[["timeseqage"]]<-pred_age_timeseqage$Predicted_Age
+  
   for (rep in c("Rep1","Rep2")){
-    metrics_rep<-calculate_metrics(pred_age_tmp[pred_age_tmp$Rep==rep,],all_clock$Clock)
+    metrics_rep<-calculate_metrics(pred_age_tmp[pred_age_tmp$Rep==rep,],all_clock$Clock[1:55])
     metrics_rep[["Rep"]]<-rep(rep,nrow(metrics_rep))
     metrics_rep[["Dataset"]]<-rep(dataset_all[i],nrow(metrics_rep))
     if (nrow(metrics_all)==0){metrics_all<-metrics_rep}else{metrics_all<-rbind(metrics_all,metrics_rep)}
   }
 }
 metrics_all$Dataset<-factor(metrics_all$Dataset,levels=unique(metrics_all$Dataset))
-metrics_all[["Clock"]]<-rep(all_clock$Clock,12)
+metrics_all[["Clock"]]<-rep(all_clock$Clock[1:55],12)
 
 # Hi_Repro
-metrics_use<-metrics_all[metrics_all$Clock%in%all_clock[all_clock$Category=="Hi-Repro","Clock"],]
+metrics_use<-metrics_all[metrics_all$Clock%in%clock_info[clock_info$Category=="Hi-Repro","Clock"],]
 metrics_order<-metrics_use[metrics_use$Dataset=="gDNA_EPICv2",]
 metrics_order<-metrics_order[order(metrics_order$MAE,decreasing = T),]
 
@@ -1209,7 +1149,7 @@ p <-ggplot(metrics_use,aes(x = MAE, y = Clock)) +
 ggsave("figure/fig_2a.pdf", p, width = 18,heigh=5)
 
 # Hi-Cov-All
-metrics_use<-metrics_all[metrics_all$Clock%in%all_clock[all_clock$Category=="Hi-Cov-All","Clock"],]
+metrics_use<-metrics_all[metrics_all$Clock%in%clock_info[clock_info$Category=="Hi-Cov-All","Clock"],]
 metrics_order<-metrics_use[metrics_use$Dataset=="gDNA_EPICv2",]
 metrics_order<-metrics_order[order(metrics_order$MAE,decreasing = T),]
 metrics_use$Clock<-factor(metrics_use$Clock,levels=unique(metrics_order$Clock))
@@ -1236,10 +1176,10 @@ p <-ggplot(metrics_use,aes(x = MAE, y = Clock)) +
     plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
   facet_wrap(~Dataset,nrow=1)
 
-ggsave("figure/fig_2b.pdf", p, width = 18,heigh=10)
+ggsave("figure/fig_S6a.pdf", p, width = 18,heigh=10)
 
 # Hi-Cov-All
-metrics_use<-metrics_all[metrics_all$Clock%in%all_clock[all_clock$Category=="Hi-Cov-nonMSA","Clock"],]
+metrics_use<-metrics_all[metrics_all$Clock%in%clock_info[clock_info$Category=="Hi-Cov-nonMSA","Clock"],]
 metrics_order<-metrics_use[metrics_use$Dataset=="gDNA_EPICv2",]
 metrics_order<-metrics_order[order(metrics_order$MAE,decreasing = T),]
 metrics_use$Clock<-factor(metrics_use$Clock,levels=unique(metrics_order$Clock))
@@ -1266,7 +1206,38 @@ p <-ggplot(metrics_use,aes(x = MAE, y = Clock)) +
     plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
   facet_wrap(~Dataset,nrow=1)
 
-ggsave("figure/fig_S6a.pdf", p, width = 18,heigh=8)
+ggsave("figure/fig_S6b.pdf", p, width = 18,heigh=8)
+
+# Sequencing-Clock
+metrics_use<-metrics_all[metrics_all$Clock%in%c("emseqage","timeseqage"),]
+metrics_order<-metrics_use[metrics_use$Dataset=="gDNA_EPICv2",]
+metrics_order<-metrics_order[order(metrics_order$MAE,decreasing = T),]
+
+metrics_use$Clock<-factor(metrics_use$Clock,levels=unique(metrics_order$Clock))
+metrics_use$Dataset<-factor(metrics_use$Dataset)
+
+p <-ggplot(metrics_use,aes(x = MAE, y = Clock)) +
+  geom_segment(aes(y = Clock, yend = Clock, x =0, xend = MAE), linewidth =0.8, color ='grey80') +
+  geom_point(aes(fill = R,pch=Rep), color="black",pch=21,size =6) +
+  scale_fill_gradient2(low="#3498db",mid="white",high="#871c1c",midpoint = 0.8,
+                       limits = c(0.3, 1),breaks = c(0.3,0.5,0.7,0.9),oob = scales::squish)+
+  scale_x_continuous(limits =c(0,50),expand =c(0,1)) +
+  labs(title ="Sequencing-Clock", x ="MAE", y =NULL) +
+  theme_bw(base_size =18) +
+  theme(
+    panel.grid.major = element_blank(),
+    strip.background = element_rect(fill="white"),
+    strip.text = element_text(size=22,face="bold"),
+    axis.title = element_text(size = 22),
+    axis.text.x = element_text(angle = 90, size = 22, color = "black", hjust = 1, vjust = 0.5),
+    axis.text.y = element_text(size = 22, color = "black"),
+    axis.ticks = element_line(color = "black"),
+    legend.text = element_text(size = 22, color = "black"),
+    legend.title = element_text(size = 22, color = "black"),
+    plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
+  facet_wrap(~Dataset,nrow=1)
+
+ggsave("figure/fig_2f.pdf", p, width = 18,heigh=3)
 
 # 4.5 scatter between ICC and R/MAE
 rownames(age_icc)<-paste0(age_icc$Dataset,"_",age_icc$Clock)
@@ -1282,7 +1253,7 @@ plot_data2<-plot_data2[rownames(age_icc),]
 plot_data2[["ICC"]]<-age_icc$ICC
 
 plot_data<-rbind(plot_data1,plot_data2)
-plot_data<-plot_data[plot_data$Clock%in%all_clock[all_clock$Category=="Hi-Cov-All","Clock"],]
+plot_data<-plot_data[plot_data$Clock%in%clock_info[clock_info$Category=="Hi-Cov-All","Clock"],]
 p<-ggplot(plot_data, aes(x = ICC, y = R)) +
   geom_point(aes(fill=Rep),color="black",shape = 21,size=3,alpha = 0.7) +
   scale_color_manual(values=group_color)+
@@ -1319,7 +1290,7 @@ p<-ggplot(plot_data, aes(x = ICC, y = R)) +
     legend.position = "null",
     plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
   facet_wrap(~Dataset,nrow=2)
-ggsave("figure/fig_2g.pdf", p, width = 9, height = 7)
+ggsave("figure/fig_2e.pdf", p, width = 9, height = 7)
 
 p<-ggplot(plot_data, aes(x = ICC, y = MAE)) +
   geom_point(aes(fill=Rep),color="black",shape = 21,size=3,alpha = 0.7) +
@@ -1343,17 +1314,18 @@ p<-ggplot(plot_data, aes(x = ICC, y = MAE)) +
     plot.title = element_text(size = 24, hjust = 0.5, vjust = 0))+
   facet_wrap(~Dataset,nrow=2)
 
-ggsave("figure/fig_2h.pdf", p, width = 9, height = 8)
+ggsave("figure/fig_2d.pdf", p, width = 9, height = 8)
 
 #### 5. validation by GSE232346 and GSE245628 ####
 metrics1<-fread("result/metrics_GSE232346.txt",sep="\t",header=T,data.table=F)
 metrics2<-fread("result/metrics_GSE245628.txt",sep="\t",header=T,data.table=F)
 plot_data<-rbind(metrics1,metrics2)
-plot_data$clock<-factor(plot_data$clock,levels=c("hannum","horvath2013","skinandblood","dnamphenoage","timeseq"))
+plot_data$clock<-factor(plot_data$clock,levels=c("hannum","horvath2013","skinandblood","dnamphenoage","timeseqage"))
+plot_data<-plot_data[plot_data$clock!="timeseqage",]
 plot_data[["label_cor"]]<-as.character(round(plot_data$cor,2))
 plot_data[["label_mae"]]<-as.character(round(plot_data$mae,2))
 colors<-c("#AD3B8F","#46C1BB","#F0545D","#94C73D","#d48a50")
-
+colors<-colors[1:4]
 p1 <- ggplot(plot_data, aes(x = clock, y = cor, color = clock)) +  
   geom_point(size = 4) +  
   geom_segment(aes(x = clock, xend = clock, y = 0, yend = cor),
@@ -1415,7 +1387,5 @@ p3 <- ggplot(plot_data, aes(x = clock, y = mae, color = clock)) +
 p12 <- p1 / p2 + plot_layout(heights = c(1, 0.05))
 p32 <- p3 / p2 + plot_layout(heights = c(1, 0.05))
 
-ggsave("figure/fig_2e.pdf", plot = p12, width = 6, height = 6)
-ggsave("figure/fig_2f.pdf", plot = p32, width = 6, height = 6)
-
-#==============================================================================
+ggsave("figure/fig_2g.pdf", plot = p12, width = 6, height = 6)
+ggsave("figure/fig_2h.pdf", plot = p32, width = 6, height = 6)

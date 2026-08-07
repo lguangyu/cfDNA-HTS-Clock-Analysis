@@ -1,0 +1,597 @@
+#!/usr/bin/env snakemake
+import dataclasses
+import gc
+import gzip
+import json
+import os
+import pdb
+import pickle
+import sys
+
+import numpy
+import pandas
+import sklearn.linear_model
+import sklearn.model_selection
+import tqdm
+
+
+python = "../.env/bin/python3"
+all_outputs = list()
+
+srrsh_data_npz = "curated/srrsh_combined.npz"
+################################################################################
+# original clock prediction
+clock_list_file = "../custom_script/pylib/data/clocks.txt"
+pyaging_data_dir = "../supp/pyaging_data"
+base_pred_file = "result/base_pred.tsv"
+all_outputs.append(base_pred_file)
+rule clock_baseline_pred:
+	input:
+		data_file=srrsh_data_npz,
+		clock_list_file=clock_list_file,
+	output:
+		base_pred_file,
+	params:
+		pyaging_data_dir=pyaging_data_dir,
+	run:
+		import pyaging
+		
+		# load clock list
+		with open(input.clock_list_file, "r") as fp:
+			clock_list = fp.read().strip().split(",")
+
+		# load data
+		print("loading data bundle", file=sys.stderr)
+		data = numpy.load(input.data_file)
+		sample = data["sample"]
+		sex = data["sex"]
+		age = data["age"]
+		cpgs = data["cpgs"]
+		beta = data["beta"]
+		
+		# making prediction data
+		print("preparing prediction data", file=sys.stderr)
+		meta_df = pandas.DataFrame(index=sample)
+		meta_df["sex"] = sex
+		meta_df["age"] = age
+		beta_df = pandas.DataFrame(beta, index=sample, columns=cpgs)
+		# concatenate
+		pred_df = meta_df.join(beta_df)
+
+		# preprocess
+		print("preprocessing", file=sys.stderr)
+		pred_df = pyaging.pp.epicv2_probe_aggregation(pred_df)
+		adata = pyaging.pp.df_to_adata(pred_df,
+			metadata_cols=["sex", "age"],
+			imputer_strategy="knn",
+		)
+
+		# predict
+		print("predicting", file=sys.stderr)
+		pyaging.pred.predict_age(adata, clock_names=clock_list,
+			dir=params.pyaging_data_dir,
+		)
+
+		# save
+		adata.obs.to_csv(output[0], sep="\t", index=True)
+
+
+################################################################################
+# df-im-tl adaptation predict
+# load clock list
+with open(clock_list_file, "r") as fp:
+	clock_list = fp.read().strip().split(",")
+
+for clock in clock_list:
+	clock_adapt_pred_file = f"result/adapt_pred.{clock}.pkl.gz"
+	#all_outputs.append(clock_adapt_pred_file)
+	rule:
+		name: f"clock_adapt_pred_{clock}",
+		input:
+			data_file=srrsh_data_npz,
+			base_pred_file=base_pred_file,
+			pca_cpgs_file="data/pca_cpgs.list",
+			pca_file="data/pca.pkl",
+		output:
+			clock_adapt_pred_file,
+		params:
+			use_pca=True,
+			df_thres=10,
+			imputer_strategy="knn",
+			tl_clock=clock,
+			random_seed=42,
+			cv=5,
+			en_cv=5,
+			en_alphas=10,
+			en_l1_ratio=[0.001, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99, 0.999],
+			en_n_jobs=32,
+		run:
+			import threadpoolctl
+			import pyaging
+
+			threadpoolctl.threadpool_limits(params.en_n_jobs, user_api="blas")
+
+			# load base prediction
+			print("loading base prediction", file=sys.stderr)
+			base_pred_df = pandas.read_csv(input.base_pred_file, sep="\t", index_col=0)
+
+			# load data
+			print("loading data bundle", file=sys.stderr)
+			data = numpy.load(input.data_file)
+			sample = data["sample"]
+			sex = data["sex"]
+			age = data["age"]
+			cpgs = data["cpgs"]
+			beta = data["beta"]
+
+			print("depth filtering", file=sys.stderr)
+			df_mask = (data["depth"] < params.df_thres) & ((beta == 0) | (beta == 1))
+			total_removed = df_mask.sum()
+			print(f"{total_removed} ({total_removed / beta.size * 100:.2f}%) values removed", file=sys.stderr)
+			beta[df_mask] = numpy.nan
+			gc.collect()
+
+			# im
+			print("imputing", file=sys.stderr)
+			beta_df = pandas.DataFrame(beta, index=sample, columns=cpgs)
+			beta_df = pyaging.pp.epicv2_probe_aggregation(beta_df, verbose=False)
+			adata = pyaging.pp.df_to_adata(beta_df,
+				metadata_cols=list(),
+				imputer_strategy=params.imputer_strategy,
+				verbose=False,
+			)
+			beta = adata.X.astype(numpy.float32)
+			del beta_df, adata
+			gc.collect()
+
+			if params.use_pca:
+				# load pca
+				print("loading pca", file=sys.stderr)
+				with open(input.pca_cpgs_file, "r") as fp:
+					pca_cpgs = fp.read().strip().splitlines()
+				with open(input.pca_file, "rb") as fp:
+					pca = pickle.load(fp)
+
+				# apply pca
+				print("applying pca", file=sys.stderr)
+				pca_beta = numpy.zeros((beta.shape[0], len(pca_cpgs)), dtype=numpy.float32)
+				cpg_to_idx = {cpg: i for i, cpg in enumerate(cpgs)}
+				for i, cpg in tqdm.tqdm(enumerate(pca_cpgs)):
+					if cpg in cpg_to_idx:
+						pca_beta[:, i] = beta[:, cpg_to_idx[cpg]]
+				# fill na
+				numpy.nan_to_num(pca_beta, nan=0.0, copy=False)
+				beta = pca.transform(pca_beta)
+				del pca, pca_beta
+				gc.collect()
+
+			# concate beta with baseline clock prediction
+			print("concatenating baseline prediction", file=sys.stderr)
+			base_pred = base_pred_df[params.tl_clock].values.astype(numpy.float32)
+			beta = numpy.concatenate([base_pred.reshape(-1, 1), beta], axis=1)
+			gc.collect()
+
+			# tl
+			print("tl cross-validation", file=sys.stderr)
+			tl_pred = pandas.DataFrame(index=sample, columns=["sex", "age", params.tl_clock])
+			tl_pred["sex"] = sex
+			tl_pred["age"] = age
+
+			en_list = list()
+			for train_idx, test_idx in sklearn.model_selection.KFold(
+				n_splits=params.cv, shuffle=True, random_state=params.random_seed,
+			).split(beta):
+				# split
+				x_train, y_train = beta[train_idx], age[train_idx]
+				x_test, y_test = beta[test_idx], age[test_idx]
+				# train
+				en = sklearn.linear_model.ElasticNetCV(
+					alphas=params.en_alphas, l1_ratio=params.en_l1_ratio,
+					cv=params.en_cv, n_jobs=params.en_n_jobs,
+				)
+				en.fit(x_train, y_train)
+				en_list.append(en)
+				# predict
+				_pred = en.predict(x_test)
+				tl_pred.iloc[test_idx, tl_pred.columns.get_loc(params.tl_clock)] = _pred
+
+			# save
+			res = {
+				"clock": params.tl_clock,
+				"result": tl_pred,
+				"en_list": en_list,
+			}
+			with gzip.open(output[0], "wb") as fp:
+				pickle.dump(res, fp)
+
+
+################################################################################
+# combine tl results
+adapt_pred_file = "result/adapt_pred.tsv"
+all_outputs.append(adapt_pred_file)
+rule combine_adapt_pred:
+	input:
+		adapt_pred_files=expand("result/adapt_pred.{clock}.pkl.gz", clock=clock_list),
+	output:
+		adapt_pred_file,
+	run:
+		pred_df = None
+		clock_list = list()
+
+		for adapt_pred_file in tqdm.tqdm(input.adapt_pred_files):
+			with gzip.open(adapt_pred_file, "rb") as fp:
+				res = pickle.load(fp)
+			clock_list.append(res["clock"])
+			adapt_pred = res["result"]
+			if pred_df is None:
+				pred_df = adapt_pred
+			else:
+				pred_df[res["clock"]] = adapt_pred[res["clock"]]
+
+		# sort clocks
+		clock_list = sorted(clock_list)
+		meta_cols = pred_df.columns.difference(clock_list)
+		pred_df = pred_df[meta_cols.tolist() + clock_list]
+
+		# save
+		pred_df.to_csv(output[0], sep="\t", index=True)
+
+
+################################################################################
+# prepare clinical data info
+srrsh_clinical_data_file = "data/srrsh_clinical.npz"
+all_outputs.append(srrsh_clinical_data_file)
+rule prep_clinical_data:
+	input:
+		clinical_file="external/clinical_info.tsv",
+	output:
+		srrsh_clinical_data_file,
+	run:
+		# load clinical data
+		clinical_df = pandas.read_csv(input.clinical_file, sep="\t", index_col=0)
+
+		# select columns
+		cohort = clinical_df["Cohort"].values
+		status = clinical_df["Status"].values
+		sex = clinical_df["Gender"].values
+		age = clinical_df["Age"].values
+		drop_cols = ["Cohort", "Status", "ID", "Gender", "Age"]
+		clinical_df.drop(columns=drop_cols, inplace=True)
+
+		# save
+		numpy.savez_compressed(output[0],
+			sample=clinical_df.index.tolist(),
+			cohort=cohort.tolist(),
+			status=status.tolist(),
+			sex=sex.tolist(),
+			age=age.tolist(),
+			columns=clinical_df.columns.tolist(),
+			data=clinical_df.values,
+		)
+
+
+################################################################################
+# clinical clock train
+clinical_clock_model_file = "result/clinical_clock_model.pkl.gz"
+clinical_clock_model_pred_file = "result/clinical_clock_model_pred.tsv"
+all_outputs.append(clinical_clock_model_file)
+all_outputs.append(clinical_clock_model_pred_file)
+rule clinical_clock_train:
+	input:
+		clinical_data=srrsh_clinical_data_file,
+	output:
+		model_file=clinical_clock_model_file,
+		pred_file=clinical_clock_model_pred_file,
+	params:
+		random_seed=42,
+		en_cv=5,
+		en_alphas=10,
+		en_l1_ratio=[0.001, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99, 0.999],
+		en_n_jobs=32,
+	run:
+		# load clinical data
+		data_bundle = numpy.load(input.clinical_data)
+		sample = data_bundle["sample"]
+		true_age = data_bundle["age"]
+		data = data_bundle["data"]
+		# fill nan
+		data = numpy.nan_to_num(data, nan=0.0)
+
+		# select features
+		n_feat = int(data.shape[1] * 0.8)
+		corr = numpy.array([numpy.corrcoef(data[:, i], true_age)[0, 1] for i in range(data.shape[1])])
+		numpy.nan_to_num(corr, nan=-numpy.inf, copy=False)
+		corr_abs_sort = numpy.argsort(numpy.abs(corr))
+		feat_idx = corr_abs_sort[-n_feat:]
+		filt_idx = corr_abs_sort[:-n_feat]
+		data = data[:, feat_idx]
+		filt_features = data_bundle["columns"][feat_idx]
+
+		# train
+		split_model_list = list()
+		for train_idx, test_idx in tqdm.tqdm(
+			sklearn.model_selection.KFold(
+				n_splits=5, shuffle=True, random_state=params.random_seed,
+			).split(data)
+		):
+			x_train, y_train = data[train_idx], true_age[train_idx]
+			x_test, y_test = data[test_idx], true_age[test_idx]
+
+			model = sklearn.pipeline.Pipeline([
+				("scaler", sklearn.preprocessing.StandardScaler()),
+				("regressor", sklearn.linear_model.ElasticNetCV(
+					alphas=params.en_alphas, l1_ratio=params.en_l1_ratio,
+					cv=params.en_cv, n_jobs=params.en_n_jobs,
+					max_iter=1000000,
+				)),
+			])
+			model.fit(x_train, y_train)
+
+		# select hyperparameter
+		final_l1_ratio = numpy.median([m.named_steps["regressor"].l1_ratio_ for m in split_model_list])
+		final_alpha = numpy.median([m.named_steps["regressor"].alpha_ for m in split_model_list])
+		
+		# retrain on full data with selected hyperparameter
+		final_model = sklearn.pipeline.Pipeline([
+			("scaler", sklearn.preprocessing.StandardScaler()),
+			("regressor", sklearn.linear_model.ElasticNet(
+				alpha=final_alpha, l1_ratio=final_l1_ratio,
+				max_iter=1000000,
+			)),
+		])
+		final_model.fit(data, true_age)
+		model_list = [final_model]
+
+		# save model and prediction
+		res = {
+			"result": clinical_pred.tolist(),
+			"features": filt_features.tolist(),
+			"model_list": model_list,
+		}
+		with gzip.open(output.model_file, "wb") as fp:
+			pickle.dump(res, fp)
+
+		pred_df = pandas.DataFrame({
+			"sample": sample,
+			"true_age": true_age,
+			"clinical": clinical_pred,
+		})
+		pred_df.to_csv(output.pred_file, sep="\t", index=False)
+
+
+################################################################################
+# export clinical clock coefs
+clinical_clock_coef_file = "result/clinical_clock_coef.tsv"
+all_outputs.append(clinical_clock_coef_file)
+rule export_clinical_clock_coef:
+	input:
+		model_file=clinical_clock_model_file,
+	output:
+		clinical_clock_coef_file,
+	run:
+		with gzip.open(input.model_file, "rb") as fp:
+			model_bundle = pickle.load(fp)
+		model = model_bundle["model_list"][0]
+		features = model_bundle["features"]
+		scaler = model["scaler"]
+		regressor = model["regressor"]
+
+		# collect data
+		feat_list = ["_INTERCEPT"]
+		pp_mean = [numpy.nan]
+		pp_scale = [numpy.nan]
+		coef = [regressor.intercept_]
+		for i, c in enumerate(regressor.coef_):
+			if c != 0:
+				feat_list.append(features[i])
+				pp_mean.append(scaler.mean_[i])
+				pp_scale.append(scaler.scale_[i])
+				coef.append(c)
+
+		# save as tsv
+		coef_df = pandas.DataFrame(index=feat_list,
+			data={
+				"pp_mean": pp_mean,
+				"pp_scale": pp_scale,
+				"coef": coef,
+		})
+		coef_df.to_csv(output[0], sep="\t", index=True)
+
+
+################################################################################
+# plot clinical clock pred
+clinical_clock_plot_basename = "output/clinical_clock_pred"
+clinical_clock_plot_files = expand(clinical_clock_plot_basename + ".{ext}", ext=["svg", "png", "pdf"])
+all_outputs.extend(clinical_clock_plot_files)
+rule plot_clinical_clock_pred:
+	input:
+		pred_file=clinical_clock_model_pred_file,
+		clock_locale="data/clock_locale.json",
+	output:
+		clinical_clock_plot_files,
+	run:
+		import scipy.stats
+		import matplotlib.pyplot
+		import mpllayout
+
+		matplotlib.rcParams["font.size"] = 8
+
+		# load prediction
+		pred_df = pandas.read_csv(input.pred_file, sep="\t")
+
+		# load clock locale
+		with open(input.clock_locale, "r") as f:
+			clock_locale = json.load(f)
+
+		# plot
+		# setup layout
+		lc = mpllayout.LayoutCreator(
+			left_margin=0.5,
+			right_margin=0.2,
+			top_margin=0.2,
+			bottom_margin=0.5,
+		)
+
+		axes = lc.add_frame("axes")
+		axes.set_anchor("bottomleft")
+		axes.set_size(2, 2)
+
+		layout = lc.create_figure_layout()
+		figure = layout["figure"]
+
+		# add data
+		axes = layout["axes"]
+		axes.scatter(pred_df["true_age"], pred_df["clinical"], s=20, marker="o",
+			linewidth=0.5, edgecolor="#000000", facecolor="#88ff0080",
+			zorder=10,
+		)
+
+		# add diagonal line
+		min_age = min(pred_df["true_age"].min(), pred_df["clinical"].min())
+		max_age = max(pred_df["true_age"].max(), pred_df["clinical"].max())
+		axes.plot([min_age, max_age], [min_age, max_age], linestyle="--",
+			linewidth=0.5, color="#000000",
+		)
+
+		# add text
+		reg = scipy.stats.linregress(pred_df["true_age"], pred_df["clinical"])
+		mae = numpy.abs(pred_df["true_age"] - pred_df["clinical"]).mean()
+		text = f"R = {reg.rvalue:.2f}\np = {reg.pvalue:.2e}\nMAE = {mae:.2f} yrs"
+		axes.text(0.05, 0.95, text, transform=axes.transAxes,
+			verticalalignment="top", horizontalalignment="left",
+		)
+
+		# add regression line
+		x = numpy.linspace(min_age, max_age, 100)
+		y = reg.slope * x + reg.intercept
+		axes.plot(x, y, linestyle="-", linewidth=1.0, color="#ff8400",
+			zorder=20,)
+
+		# misc
+		range_pad = (max_age - min_age) * 0.05
+		axes.set_xlim(min_age - range_pad, max_age + range_pad)
+		axes.set_ylim(min_age - range_pad, max_age + range_pad)
+		axes.set_xlabel("CA (yrs)")
+		axes.set_ylabel(("{} (yrs)").format(clock_locale["clinical_pred"]))
+
+		# save and clean up
+		for ofname in output:
+			matplotlib.pyplot.savefig(ofname, dpi=300)
+		matplotlib.pyplot.close()
+
+
+################################################################################
+# perpare srrsh 24 data
+srrsh_24_datasets = ["RB_GALAXY", "RB_TWIST", "RB_GDNA_GALAXY", "RB_GDNA_TWIST"]
+for ds in srrsh_24_datasets:
+	srrsh_24_pred_file = f"result/srrsh_24.{ds}.npz"
+	all_outputs.append(srrsh_24_pred_file)
+	rule:
+		name: f"prep_srrsh_24_{ds}",
+		input:
+			meta_file = f"../runs/{ds}/final.metadata.tsv",
+			plain_pred_file = f"../runs/{ds}/final.full.age_pred.tsv",
+			adapt_pred_file = "../fig_5/transfer_learn.age_pred.pkl",
+			clinical_pred_file = "result/clinical_clock_model_pred.tsv",
+			clinical_meta_file = "external/sample_info.txt",
+		params:
+			dataset = ds,
+			tl_meth = "distill",
+		output:
+			srrsh_24_pred_file,
+		run:
+			# load metadata
+			meta_df = pandas.read_csv(input.meta_file, sep="\t", index_col=0)
+			library_to_sample = meta_df["sample"].to_dict()
+
+			# load plain prediction
+			plain_pred_df = pandas.read_csv(input.plain_pred_file, sep="\t", index_col=0)
+			plain_pred_df.drop(columns=["sample", "sex", "age"], inplace=True)
+			plain_pred_clocks = plain_pred_df.columns.tolist()
+
+			# load adapt prediction
+			with open(input.adapt_pred_file, "rb") as fp:
+				adapt_pred_df = pickle.load(fp)[params.dataset][params.tl_meth]["preds"]
+			adapt_pred_df.drop(columns=["sample", "sex", "age", "no_transfer"], inplace=True)
+			adapt_pred_clocks = adapt_pred_df.columns.tolist()
+
+			# load clinical prediction
+			clinical_pred_df = pandas.read_csv(input.clinical_pred_file, sep="\t", index_col=0)
+			clinical_pred_df_ext = pandas.Series(index=meta_df.index)
+			for idx in clinical_pred_df_ext.index:
+				sample = library_to_sample[idx]
+				if sample not in clinical_pred_df.index:
+					continue
+				clinical_pred_df_ext.loc[idx] = clinical_pred_df.loc[sample, "clinical"]
+			# drop nans
+			clinical_pred_df_ext.dropna(inplace=True)
+
+			# harmonize samples
+			sample = meta_df.index\
+				.intersection(plain_pred_df.index)\
+				.intersection(adapt_pred_df.index)\
+				.intersection(clinical_pred_df_ext.index)
+
+			# harmonize clocks
+			clocks = sorted(set(plain_pred_clocks).intersection(adapt_pred_clocks))
+
+			# filter by shared samples and clocks
+			sex = meta_df.loc[sample, "sex"].values
+			true_age = meta_df.loc[sample, "age"].values
+			clinical_pred = clinical_pred_df_ext.loc[sample].values
+			plain_pred = plain_pred_df.loc[sample, clocks].values
+			adapt_pred = adapt_pred_df.loc[sample, clocks].values
+
+			# save
+			numpy.savez_compressed(output[0],
+				sample=sample.tolist(),
+				age=true_age.tolist(),
+				clocks=clocks,
+				clinical_pred=clinical_pred.tolist(),
+				plain_pred=plain_pred.tolist(),
+				adapt_pred=adapt_pred.tolist(),
+			)
+
+
+################################################################################
+# clinical clock external test
+clinical_clock_test_pred_file = "result/clinical_clock.external_test.pred.tsv"
+all_outputs.append(clinical_clock_test_pred_file)
+rule clinical_clock_external_test:
+	input:
+		clinical_clock_model=clinical_clock_model_file,
+		data_file="external/pumch_clinical_data.curated.tsv",
+	output:
+		age_pred=clinical_clock_test_pred_file,
+	run:
+		# load model
+		with gzip.open(input.clinical_clock_model, "rb") as fp:
+			model_bundle = pickle.load(fp)
+		model = model_bundle["model_list"][0]
+		features = model_bundle["features"]
+
+		# load data
+		data_df = pandas.read_csv(input.data_file, sep="\t", index_col=0)
+		data_df.index = data_df["Subject ID"]
+		res_df = data_df[["Sex", "Age"]]
+		res_df.columns = ["sex", "age"]
+
+		# create data for prediction
+		#pred_df = data_df[features]
+		pred_df = data_df.reindex(columns=features)
+		# convert to float, if fails, fill with nan
+		pred_df = pred_df.apply(pandas.to_numeric, errors="coerce")
+		pred_df.fillna(0.0, inplace=True)
+
+		# prediction
+		pred_age = model.predict(pred_df.values)
+		res_df["clinical_age"] = pred_age
+
+		# save
+		res_df.to_csv(output.age_pred, sep="\t", index=True)
+
+
+rule all:
+	input:
+		all_outputs,
+	default_target: True

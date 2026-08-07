@@ -743,10 +743,7 @@ def _calc_classif_res(d_da: numpy.ndarray, h_da: numpy.ndarray,
 	pred_y = numpy.zeros_like(y, dtype=int)
 
 	# model
-	# driver = sklearn.linear_model.LogisticRegression(solver="liblinear")
 	driver = sklearn.svm.SVC(kernel="linear", probability=True)
-	# driver = sklearn.svm.SVC(kernel="poly", degree=2)
-	# driver = sklearn.naive_bayes.GaussianNB()
 
 	# cross-validation
 	# cv = sklearn.model_selection.LeaveOneOut()
@@ -931,8 +928,8 @@ def _main():
 	dh_comp_cfgs = [
 		DHCompCfg(
 			key="GSE164600",
-			d_file="cross_test.RB_GALAXY-RB_TWIST-RB_SRRSH.GSE164600_D.with_imput.age_pred.pkl",
-			h_file="cross_test.RB_GALAXY-RB_TWIST-RB_SRRSH.GSE164600_N.with_imput.age_pred.pkl",
+			d_file="cross_test.RB_GALAXY-RB_TWIST-RB_SRRSH.GSE164600_D.no_df.with_imput.age_pred.pkl",
+			h_file="cross_test.RB_GALAXY-RB_TWIST-RB_SRRSH.GSE164600_N.no_df.with_imput.age_pred.pkl",
 			d_label="ALS",
 			h_label="Normal",
 			plot_relative=True,

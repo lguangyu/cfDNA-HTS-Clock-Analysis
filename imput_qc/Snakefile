@@ -1,0 +1,570 @@
+#!/usr/bin/env snakemake
+
+import dataclasses
+import gzip
+import itertools
+import json
+import os
+import pdb
+import pickle
+import sys
+
+import numpy
+import pandas
+import scipy
+import sklearn
+import tqdm
+
+
+@dataclasses.dataclass
+class DatasetConfig(object):
+	key: str
+	display_name: str = None
+
+	def __post_init__(self):
+		if self.display_name is None:
+			self.display_name = self.key
+		return
+
+DATASET_CONFIGS = [
+	DatasetConfig(key="RB_GALAXY", display_name="cfDNA_Galaxy"),
+	DatasetConfig(key="RB_TWIST", display_name="cfDNA_Twist"),
+	DatasetConfig(key="RB_GDNA_GALAXY", display_name="gDNA_Galaxy"),
+	DatasetConfig(key="RB_GDNA_TWIST", display_name="gDNA_Twist"),
+]
+
+@dataclasses.dataclass
+class MaskFracConfig(object):
+	value: float
+
+	@property
+	def display_str(self):
+		return ("{:03d}").format(int(self.value * 100))
+
+	def __str__(self):
+		return self.display_str
+
+
+MASK_FRAC_CONFIGS = [
+	MaskFracConfig(0.01),
+	MaskFracConfig(0.02),
+	MaskFracConfig(0.05),
+	MaskFracConfig(0.1),
+	MaskFracConfig(0.2),
+	MaskFracConfig(0.5),
+	MaskFracConfig(1.0),
+]
+
+@dataclasses.dataclass
+class ImputMethConfig(object):
+	key: str
+	display_name: str = None
+	external: bool = False
+
+	def __post_init__(self):
+		if self.display_name is None:
+			self.display_name = self.key
+		return
+
+IMPUT_METH_CONFIGS = [
+	ImputMethConfig(key="mean"),
+	ImputMethConfig(key="median"),
+	ImputMethConfig(key="knn"),
+	ImputMethConfig(key="constant", display_name="0-filling"),
+]
+
+PLOT_EXTS = ["png", "pdf", "svg"]
+
+
+all_outputs = list()
+
+
+# merge metadata info
+merge_datasets = ["RB_935K"] + [cfg.key for cfg in DATASET_CONFIGS]
+meta_files = [f"data/{dataset}/meta.tsv" for dataset in merge_datasets]
+meta_merged_out = "curated/meta_merged.tsv"
+all_outputs.append(meta_merged_out)
+rule merge_meta:
+	input:
+		meta_files,
+	output:
+		meta_merged_out,
+	params:
+		dataset_list=merge_datasets,
+	run:
+		meta_dfs = list()
+		for ds in params.dataset_list:
+			meta_df = pandas.read_csv(f"data/{ds}/meta.tsv", sep="\t")
+			meta_df.index = meta_df["SampleID"]
+			# extract library names
+			meta_df = meta_df[["Library name 1", "Library name 2"]]
+			meta_df.columns = [f"{ds}_R1", f"{ds}_R2"]
+
+			meta_dfs.append(meta_df)
+
+		# concate
+		meta_concat_df = pandas.concat(meta_dfs, axis=1)
+
+		# make R1/R2 columns as one
+		sample_ids = list()
+		for s in meta_concat_df.index:
+			for suffix in ["R1", "R2"]:
+				sample_ids.append(f"{s}_{suffix}")
+		meta_merged_df = pandas.DataFrame(index=sample_ids, columns=params.dataset_list)
+		for ds in params.dataset_list:
+			for suffix in ["R1", "R2"]:
+				col_name = f"{ds}_{suffix}"
+				sample_ids = [f"{s}_{suffix}" for s in meta_concat_df.index]
+				meta_merged_df.loc[sample_ids, ds] = meta_concat_df[col_name].values
+
+		# save
+		meta_merged_df.to_csv(output[0], sep="\t", index=True)
+
+
+masked_beta_files = list()
+for ds_cfg in DATASET_CONFIGS:
+	# find cpgs filter mask
+	cpg_mask_npz = f"curated/{ds_cfg.key}/cpgs_filter_mask.npz"
+	all_outputs.append(cpg_mask_npz)
+	rule:
+		name: f"find_cpgs_filter_mask.{ds_cfg.key}"
+		input:
+			meta=meta_merged_out,
+			ref_beta=f"data/RB_935K/beta.tsv",
+			ds_beta=f"data/{ds_cfg.key}/beta.tsv",
+			ds_depth=f"data/{ds_cfg.key}/depth.tsv",
+		output:
+			mask=cpg_mask_npz,
+		params:
+			ref_col="RB_935K",
+			dataset=ds_cfg.key,
+			depth_thres=30,
+			beta_diff_thres=0.10,
+		run:
+			# load meta
+			meta_df = pandas.read_csv(input.meta, sep="\t", index_col=0)
+			ref_sample_ids = meta_df[params.ref_col].values.astype(str)
+			ds_sample_ids = meta_df[params.dataset].values.astype(str)
+
+			# load beta and depth tables
+			ref_beta_df = pandas.read_csv(input.ref_beta, sep="\t", index_col=0)
+			ds_beta_df = pandas.read_csv(input.ds_beta, sep="\t", index_col=0)
+			ds_depth_df = pandas.read_csv(input.ds_depth, sep="\t", index_col=0)
+
+			# harmonize sample ids
+			ref_beta_df = ref_beta_df[ref_sample_ids]
+			ds_beta_df = ds_beta_df[ds_sample_ids]
+			ds_depth_df = ds_depth_df[ds_sample_ids]
+
+			# harmonize cpgs
+			target_cpgs = ref_beta_df.index.values.astype(str)
+			ref_beta_df = ref_beta_df.reindex(target_cpgs, fill_value=numpy.nan)
+			ds_beta_df = ds_beta_df.reindex(target_cpgs, fill_value=numpy.nan)
+			ds_depth_df = ds_depth_df.reindex(target_cpgs, fill_value=numpy.nan)
+
+			# fill na
+			ref_beta_df = ref_beta_df.fillna(0)
+			ds_beta_df = ds_beta_df.fillna(0)
+			ds_depth_df = ds_depth_df.fillna(0)
+
+			beta_diff = numpy.abs(ds_beta_df.values - ref_beta_df.values)
+
+			depth_mask = (ds_depth_df.values >= params.depth_thres)
+			# filter for abs(ref_beta - ds_beta) <= beta_diff_thres
+			beta_diff_mask = beta_diff <= params.beta_diff_thres
+			cpg_mask = depth_mask & beta_diff_mask
+
+			# save
+			numpy.savez_compressed(output.mask,
+				beta_diff_thres=params.beta_diff_thres,
+				depth_thres=params.depth_thres,
+				samples=ref_sample_ids,
+				samples_alt=ds_sample_ids,
+				cpgs=target_cpgs,
+				mask=cpg_mask,
+			)
+			
+			data=numpy.load(output.mask)
+
+
+	cpg_mask_stats_out = f"curated/{ds_cfg.key}/cpgs_filter_mask_stats.tsv"
+	all_outputs.append(cpg_mask_stats_out)
+	rule:
+		name: f"calc_cpg_mask_stats.{ds_cfg.key}",
+		input:
+			mask=cpg_mask_npz,
+		output:
+			stats=cpg_mask_stats_out,
+		run:
+			cpg_mask = numpy.load(input.mask)["mask"]
+			total_passed = cpg_mask.sum()
+			total_cpgs = cpg_mask.size
+			stats_df = pandas.DataFrame(
+				{
+					"total_cpgs": [total_cpgs],
+					"total_passed": [total_passed],
+					"pass_rate": [total_passed / total_cpgs],
+				}
+			)
+			stats_df.to_csv(output.stats, sep="\t", index=False)
+
+
+	for frac_cfg in MASK_FRAC_CONFIGS:
+		cpg_masked_beta_relapath = f"{ds_cfg.key}/masked_beta.{frac_cfg.display_str}.tsv"
+		cpg_masked_beta = f"masked/{cpg_masked_beta_relapath}"
+		all_outputs.append(cpg_masked_beta)
+		masked_beta_files.append(cpg_masked_beta_relapath)
+		rule:
+			name: f"mask_beta.{ds_cfg.key}.{frac_cfg.display_str}",
+			input:
+				mask=cpg_mask_npz,
+				beta=f"data/{ds_cfg.key}/beta.tsv",
+			output:
+				masked_beta=cpg_masked_beta,
+			params:
+				mask_frac=frac_cfg.value,
+				random_seed=42,
+			run:
+				# load mask
+				mask_data = numpy.load(input.mask)
+				cpg_mask = mask_data["mask"]
+				cpgs = mask_data["cpgs"]
+				sample_ids = mask_data["samples_alt"]
+
+				# load beta
+				beta_df = pandas.read_csv(input.beta, sep="\t", index_col=0)
+
+				# harmonize cpgs and sample ids
+				beta_df = beta_df.reindex(index=cpgs, columns=sample_ids,
+					fill_value=numpy.nan,
+				)
+
+				# fill na with 0 so all nans seen after are from masking
+				beta_df = beta_df.fillna(0)
+
+				# generate random mask
+				random_state = numpy.random.RandomState(params.random_seed)
+				rand_mask = random_state.rand(*cpg_mask.shape) < params.mask_frac
+				final_mask = cpg_mask & rand_mask
+
+				# apply mask
+				# when mask is True, set beta to nan
+				beta_df_masked = beta_df.copy()
+				beta_df_masked[final_mask] = numpy.nan
+
+				# save masked beta
+				beta_df_masked.to_csv(output.masked_beta, sep="\t")
+
+
+# write masked beta file
+masked_beta_file_list = "masked/files.list"
+all_outputs.append(masked_beta_file_list)
+rule write_masked_beta_file_list:
+	input:
+		expand("masked/{file}", file=masked_beta_files),
+	output:
+		masked_beta_file_list,
+	params:
+		file_list = masked_beta_files,
+	run:
+		with open(output[0], "w") as fp:
+			for fname in params.file_list:
+				print(fname, file=fp)
+
+
+for meth_cfg in IMPUT_METH_CONFIGS:
+	for ds_cfg in DATASET_CONFIGS:
+		for frac_cfg in MASK_FRAC_CONFIGS:
+			# imputation
+			if meth_cfg.external:
+				# imputation not done here for external results
+				continue
+			imput_out = f"imput/{meth_cfg.key}/{ds_cfg.key}/imputed.{frac_cfg.display_str}.tsv"
+			all_outputs.append(imput_out)
+			rule:
+				name: f"imput.{meth_cfg.key}.{ds_cfg.key}.{frac_cfg.display_str}",
+				input:
+					f"masked/{ds_cfg.key}/masked_beta.{frac_cfg.display_str}.tsv",
+				output:
+					imput_out,
+				params:
+					method=meth_cfg.key,
+				resources:
+					io=1,
+				run:
+					import pyaging
+
+					# load masked beta
+					print("loading masked data", file=sys.stderr)
+					masked_df = pandas.read_csv(input[0], sep="\t", index_col=0).T
+
+					# impute
+					print("imputing", file=sys.stderr)
+					adata = pyaging.pp.df_to_adata(masked_df,
+						imputer_strategy=params.method,
+					)
+
+					# df for saving
+					print("saving", file=sys.stderr)
+					imput_df = pandas.DataFrame(
+						adata.X.T,
+						index=adata.var_names,
+						columns=adata.obs_names,
+					)
+					imput_df.to_csv(output[0], sep="\t", index=True)
+
+		# calc beta diff by imputation
+		frac_str_list = [cfg.display_str for cfg in MASK_FRAC_CONFIGS]
+		imput_input_list = [f"masked/{ds_cfg.key}/masked_beta.{frac_str}.tsv" for frac_str in frac_str_list]
+		imput_out_list = [f"imput/{meth_cfg.key}/{ds_cfg.key}/imputed.{frac_str}.tsv" for frac_str in frac_str_list]
+		imput_diff = f"result/{ds_cfg.key}/imput_diff.{meth_cfg.key}.pkl.gz"
+		all_outputs.append(imput_diff)
+		rule:
+			name: f"calc_imput_diff.{meth_cfg.key}.{ds_cfg.key}",
+			input:
+				meta=meta_merged_out,
+				ref_935k="data/RB_935K/beta.tsv",
+				ref_ds=f"data/{ds_cfg.key}/beta.tsv",
+				imput_in=imput_input_list,
+				imput_out=imput_out_list
+			output:
+				imput_diff,
+			params:
+				meth_cfg=meth_cfg,
+				frac_cfgs=MASK_FRAC_CONFIGS,
+				ref_935k_col="RB_935K",
+				dataset=ds_cfg.key,
+			resources:
+				io=1,
+			run:
+				# load data
+				print("loading data", file=sys.stderr)
+				meta_df = pandas.read_csv(input.meta, sep="\t", index_col=0)
+				ref_935k_df = pandas.read_csv(input.ref_935k, sep="\t", index_col=0)
+				ref_ds_df = pandas.read_csv(input.ref_ds, sep="\t", index_col=0)
+
+				# harmonize sample ids
+				print("harmonizing data", file=sys.stderr)
+				ref_935k_sample_ids = meta_df[params.ref_935k_col].values.astype(str)
+				ref_ds_sample_ids = meta_df[params.dataset].values.astype(str)
+				ref_935k_df = ref_935k_df[ref_935k_sample_ids]
+				ref_ds_df = ref_ds_df[ref_ds_sample_ids]
+
+				res_dict = dict()
+				# process for each fraction
+				print("calculating imputation diff", file=sys.stderr)
+				for frac_cfg in tqdm.tqdm(params.frac_cfgs):
+					frac_str = frac_cfg.display_str
+					imput_in_file = f"masked/{params.dataset}/masked_beta.{frac_str}.tsv"
+					imput_out_file = f"imput/{params.meth_cfg.key}/{params.dataset}/imputed.{frac_str}.tsv"
+
+					imput_in_df = pandas.read_csv(imput_in_file, sep="\t", index_col=0)
+					imput_out_df = pandas.read_csv(imput_out_file, sep="\t", index_col=0)
+
+					# harmonize cpgs and sample ids
+					target_cpgs = ref_935k_df.index\
+						.intersection(ref_ds_df.index)\
+						.intersection(imput_in_df.index)\
+						.intersection(imput_out_df.index)
+
+					mask = numpy.isnan(imput_in_df.loc[target_cpgs, ref_ds_sample_ids].values)
+
+					ref_935k_vals = ref_935k_df.loc[target_cpgs, ref_935k_sample_ids].values[mask].flatten()
+					ref_ds_vals = ref_ds_df.loc[target_cpgs, ref_ds_sample_ids].values[mask].flatten()
+					imput_vals = imput_out_df.loc[target_cpgs, ref_ds_sample_ids].values[mask].flatten()
+					assert ref_935k_vals.shape == ref_ds_vals.shape == imput_vals.shape, "shape mismatch"
+
+					res = {
+						"935k_vals": ref_935k_vals.astype(numpy.float32),
+						"base_vals": ref_ds_vals.astype(numpy.float32),
+						"imput_vals": imput_vals.astype(numpy.float32),
+					}
+					res_dict[frac_str] = res
+
+				# save
+				print("saving results", file=sys.stderr)
+				with gzip.open(output[0], "wb") as fp:
+					pickle.dump(res_dict, fp)
+
+
+# plot imputation diff
+plot_basename = f"output/imput_diff"
+plot_outputs = [f"{plot_basename}.{ext}" for ext in PLOT_EXTS]
+all_outputs.extend(plot_outputs)
+rule:
+	name: f"plot_imput_diff",
+	input:
+		expand("result/{ds}/imput_diff.{meth}.pkl.gz",
+			ds=[cfg.key for cfg in DATASET_CONFIGS],
+			meth=[cfg.key for cfg in IMPUT_METH_CONFIGS],
+		),
+	output:
+		plot_outputs,
+	params:
+		dataset_cfgs=DATASET_CONFIGS,
+		meth_cfgs=IMPUT_METH_CONFIGS,
+		frac_cfgs=MASK_FRAC_CONFIGS,
+		plot_basename=plot_basename,
+		plot_exts=PLOT_EXTS,
+	run:
+		import matplotlib.pyplot
+		import mpllayout
+
+		n_datasets = len(params.dataset_cfgs)
+		n_methods = len(params.meth_cfgs)
+		n_fracs = len(params.frac_cfgs)
+
+		# layout
+		lc = mpllayout.LayoutCreator(
+			left_margin=1.0,
+			right_margin=0.3,
+			top_margin=0.5,
+			bottom_margin=1.2,
+		)
+
+		axes_w = 3.0
+		axes_h = 2.0
+		axes_gap_w = 0.3
+		axes_gap_h = 0.2
+
+		i = 0
+		axes_coords = dict()
+		for ds_cfg in params.dataset_cfgs:
+			for meth_cfg in params.meth_cfgs:
+				ri = (n_datasets - 1) - i // n_methods
+				ci = i % n_methods
+
+				axes_name = f"axes_{ds_cfg.key}_{meth_cfg.key}"
+				axes_coords[axes_name] = (ri, ci)
+
+				axes = lc.add_frame(axes_name)
+				axes.set_anchor("bottomleft", offsets=(
+					(axes_w + axes_gap_w) * ci,
+					(axes_h + axes_gap_h) * ri
+				))
+				axes.set_size(axes_w, axes_h)
+
+				i += 1
+
+		layout = lc.create_figure_layout()
+		layout["axes_coords"] = axes_coords
+		figure = layout["figure"]
+
+		# plot for each dataset and method
+		cmap = matplotlib.pyplot.colormaps["jet_r"]
+		xbins = numpy.linspace(0, 1, 51)
+
+		first_axes_name = f"axes_{params.dataset_cfgs[0].key}_{params.meth_cfgs[0].key}"
+		first_axes = layout[first_axes_name]
+
+		for ds_cfg, meth_cfg in tqdm.tqdm(
+			itertools.product(params.dataset_cfgs, params.meth_cfgs),
+			total=len(params.dataset_cfgs) * len(params.meth_cfgs),
+		):
+			axes_name = f"axes_{ds_cfg.key}_{meth_cfg.key}"
+			axes = layout[axes_name]
+			ri, ci = layout["axes_coords"][axes_name]
+			axes.sharex(first_axes)
+			axes.sharey(first_axes)
+
+			# load data
+			imput_diff_file = f"result/{ds_cfg.key}/imput_diff.{meth_cfg.key}.pkl.gz"
+			with gzip.open(imput_diff_file, "rb") as fp:
+				res_dict = pickle.load(fp)
+
+			# plot for each fraction
+			diff_mean_list = list()
+			diff_median_list = list()
+			diff_std_list = list()
+			diff_kurt_list = list()
+			for i, frac_cfg in enumerate(params.frac_cfgs):
+				res = res_dict[frac_cfg.display_str]
+
+				# calculate diff
+				imput_diff = numpy.abs(res["imput_vals"] - res["base_vals"])
+				diff_mean_list.append(imput_diff.mean())
+				diff_median_list.append(numpy.median(imput_diff))
+				diff_std_list.append(imput_diff.std())
+				diff_kurt_list.append(scipy.stats.kurtosis(imput_diff))
+
+				# plot as histogram
+				color = cmap((i + 0.5) / n_fracs)
+				axes.hist(imput_diff,
+					bins=xbins,
+					histtype="stepfilled",
+					linewidth=0.2,
+					edgecolor="#000000",
+					facecolor=color[:3] + (0.2,),
+					density=True,
+					label=f"{frac_cfg.display_str}",
+					zorder=20 - i,
+				)
+
+			# adding stat text
+			t = ("\n").join([
+				("mean: {:.2f}~{:.2f}").format(min(diff_mean_list), max(diff_mean_list)),
+				("median: {:.2f}~{:.2f}").format(min(diff_median_list), max(diff_median_list)),
+				("std: {:.2f}~{:.2f}").format(min(diff_std_list), max(diff_std_list)),
+				("kurtosis: {:.2f}~{:.2f}").format(min(diff_kurt_list), max(diff_kurt_list))
+			])
+			axes.text(0.45, 0.95, t,
+				horizontalalignment="left", verticalalignment="top",
+				transform=axes.transAxes,
+				fontsize=10,
+			)
+
+			# axes misc
+			axes.grid(axis="y", linestyle="-", linewidth=0.5, color="#d0d0d0")
+			axes.tick_params(
+				left=(ci == 0), labelleft=(ci == 0),
+				right=False, labelright=False,
+				bottom=(ri == 0), labelbottom=(ri == 0),
+				top=False, labeltop=False,
+			)
+			axes.set_xlim(0, 1)
+			if ri == 0:
+				axes.set_xlabel(f"Abs. imputation error (|∆beta-value|)", fontsize=12)
+			if ci == 0:
+				axes.text(-0.25, 0.5, ds_cfg.display_name, fontsize=12,
+					horizontalalignment="center", verticalalignment="center",
+					rotation=90, transform=axes.transAxes,
+				)
+				axes.set_ylabel(f"Normalized frequency", fontsize=12)
+			if ri == (n_datasets - 1):
+				axes.set_title(f"{meth_cfg.display_name}", fontsize=12)
+			for l in axes.get_xticklabels() + axes.get_yticklabels():
+				l.set_fontsize(8)
+
+		# add legend
+		handles = list()
+		for i, frac_cfg in enumerate(params.frac_cfgs):
+			color = cmap((i + 0.5) / n_fracs)
+			handle = matplotlib.patches.Patch(
+				facecolor=color[:3] + (0.2,),
+				edgecolor="#000000",
+				linewidth=0.2,
+				label=("{:d}% removal").format(int(frac_cfg.value * 100)),
+			)
+			handles.append(handle)
+
+		# put legend on the bottom of the figure, in only one row
+		figure.legend(
+			handles=handles,
+			loc=8,
+			bbox_to_anchor=(0.5, 0.01),
+			ncol=len(params.frac_cfgs),
+			handlelength=0.75,
+			frameon=True,
+			fontsize=12,
+		)
+
+		# save
+		for ext in params.plot_exts:
+			figure.savefig(f"{params.plot_basename}.{ext}", dpi=600)
+		matplotlib.pyplot.close(figure)
+
+
+rule all:
+	input:
+		all_outputs,
+	default_target: True

@@ -1,6 +1,7 @@
 # merged R and python gitignore templates
 
 # misc
+final_export.*
 *.swp
 .devel/
 .DS_Store

@@ -1,0 +1,246 @@
+#!/usr/bin/env snakemake
+
+import bz2
+import dataclasses
+import gzip
+import itertools
+import json
+import os
+import pdb
+import sys
+
+import numpy
+import pandas
+import scipy
+import sklearn
+import tqdm
+
+
+with open("clocks.txt") as fp:
+	CLOCK_LIST = fp.read().strip().split(",")
+CLOCK_LIST = [clock for clock in CLOCK_LIST if clock != "altumage"]
+DEPTH_THRES = list(range(21))
+PLOT_EXTS = ["svg", "png", "pdf"]
+
+all_outputs = list()
+
+
+################################################################################
+# calc clock coverage
+depth_stat = "output/depth_stats.tsv"
+all_outputs.append(depth_stat)
+rule calc_depth_stat:
+	input:
+		depth="data/depth.tsv",
+	output:
+		stat=depth_stat,
+	run:
+		depth_df = pandas.read_csv(input.depth, sep="\t", index_col=0)
+		depth_arr = depth_df.values
+
+		# calc stats
+		depth_mean = depth_arr.mean()
+		depth_median = numpy.median(depth_arr)
+		depth_std = depth_arr.std()
+
+		# save
+		stat_df = pandas.DataFrame({
+			"mean": [depth_mean],
+			"median": [depth_median],
+			"std": [depth_std],
+		})
+		stat_df.to_csv(output.stat, sep="\t", index=False)
+
+
+################################################################################
+# calc clock coverage
+for clock in CLOCK_LIST:
+	clock_cov_out = f"coverage/{clock}_cov.npz"
+	all_outputs.append(clock_cov_out)
+	rule:
+		name: f"calc_{clock}_cov",
+		input:
+			beta=f"data/gse164600_beta.tsv",
+			depth=f"data/gse164600_depth.tsv",
+			clock_cpgs=f"clock_cpgs/{clock}_cpgs.json.bz2",
+		output:
+			npz=clock_cov_out,
+		params:
+			clock=clock,
+			# cpg lookup is a file translates cg id to chr:pos to bridge array
+			# and hts data
+			cpg_lookup=f"cpg_lookup.json",
+			depth_thres=DEPTH_THRES,
+		resources:
+			io=1,
+		run:
+			# load cpg lookup
+			print("loading cpg lookup", file=sys.stderr)
+			with open(params.cpg_lookup) as fp:
+				cpg_lookup = json.load(fp)
+			# invert cpg lookup
+			cpg_lookup_inv = {v: k for k, v in cpg_lookup.items()}
+
+			# load clock cpgs
+			print("loading clock cpgs", file=sys.stderr)
+			with bz2.open(input.clock_cpgs, "rt") as fp:
+				clock_cpgs = json.load(fp)
+			# get the clock cpg scope
+			clock_cpg_ids = [cpg_lookup_inv.get(cpg, cpg) for cpg in clock_cpgs]
+
+			# load depth
+			print("loading depth", file=sys.stderr)
+			# depth_df is in cpgs x samples
+			depth_df = pandas.read_csv(input.depth, sep="\t", index_col=0)
+			# shrink depth_df to only include clock cpgs
+			depth_df = depth_df.reindex(clock_cpg_ids, fill_value=0)
+			depth_arr = depth_df.values
+			del depth_df
+
+			# calculate coverage at each depth threshold
+			print("calculating coverage", file=sys.stderr)
+			clock_cov_list = list()
+			for thres in params.depth_thres:
+				# calculate mean coverage per sample
+				mask_mean = (depth_arr >= thres).mean(axis=0)
+				clock_cov_list.append(mask_mean)
+
+			clock_cov_arr = numpy.array(clock_cov_list)
+
+			# save clock coverage
+			print("saving", file=sys.stderr)
+			numpy.savez_compressed(output.npz,
+				clock=params.clock,
+				depth_thres=params.depth_thres,
+				clock_cov=clock_cov_arr,
+			)
+
+
+################################################################################
+# plot
+plot_basename = "output/clock_cov"
+plot_outputs = [f"{plot_basename}.{ext}" for ext in PLOT_EXTS]
+all_outputs.extend(plot_outputs)
+rule plot_clock_cov:
+	input:
+		npz_list=[f"coverage/{clock}_cov.npz" for clock in CLOCK_LIST],
+	output:
+		plot_outputs,
+	params:
+		thres_list=[1, 10, 20],
+		plot_basename=plot_basename,
+		plot_exts=PLOT_EXTS,
+	run:
+		import matplotlib
+		matplotlib.use("Agg")
+		import matplotlib.pyplot
+		import mpllayout
+
+		# load data
+		data_list = list()
+		for fn in tqdm.tqdm(input.npz_list):
+			npz = numpy.load(fn)
+			data_list.append({k: npz[k] for k in npz.keys()})
+
+		# list clocks
+		clock_list = [v["clock"].item() for v in data_list]
+		n_clocks = len(clock_list)
+
+		# layout
+		lc = mpllayout.LayoutCreator(
+			left_margin=0.7,
+			right_margin=1.5,
+			top_margin=0.5,
+			bottom_margin=0.7,
+		)
+
+		nrows = int(numpy.sqrt(n_clocks))
+		ncols = (n_clocks + nrows - 1) // nrows
+
+		axes_w = 2.4
+		axes_h = 1.6
+		axes_gap_w = 0.5
+		axes_gap_h = 0.8
+		
+		for i, clock in enumerate(clock_list):
+			ri = nrows - 1 - (i // ncols)
+			ci = i % ncols
+			axes = lc.add_frame(clock)
+			axes.set_anchor("bottomleft", offsets=(
+				ci * (axes_w + axes_gap_w),
+				ri * (axes_h + axes_gap_h),
+			))
+			axes.set_size(axes_w, axes_h)
+
+		layout = lc.create_figure_layout()
+		figure = layout["figure"]
+
+		cmap = matplotlib.colormaps["inferno"]
+		n_thres = len(params.thres_list)
+
+		# plot
+		first_axes = layout[clock_list[0]]
+		for data in data_list:
+			clock = data["clock"].item()
+			axes = layout[clock]
+			axes.sharex(first_axes)
+
+			# plot coverage
+			for i, thres in enumerate(params.thres_list):
+				# get coverage
+				thres_idx = numpy.where(data["depth_thres"] == thres)[0][0]
+				cov_arr = data["clock_cov"][thres_idx, :]
+
+				# plot using kde
+				kde = scipy.stats.gaussian_kde(cov_arr)
+				x = numpy.linspace(0, 1, 100)
+				y = kde(x)
+				# normalize y to sum=1
+				y /= y.sum()
+
+				color=cmap((i + 0.5) / n_thres)
+				axes.plot(x, y, color=color, linewidth=0.5, zorder=10 * (i + 1))
+				axes.fill_between(x, 0, y, color=color, alpha=0.5, zorder=10 * (i + 1))
+
+			# misc
+			axes.tick_params(
+				left=False, labelleft=False,
+				bottom=True, labelbottom=True,
+				top=False, labeltop=False,
+				right=False, labelright=False,
+			)
+			axes.set_xlim(0, 1)
+			axes.set_ylim(0, None)
+			axes.set_xlabel("Sample-level coverage", fontsize=10)
+			axes.set_ylabel("Normalized p.d.f.", fontsize=10)
+			axes.set_title(clock, fontsize=12)
+
+		# legend
+		handles = list()
+		for i, thres in enumerate(params.thres_list):
+			color=matplotlib.colors.to_hex(cmap((i + 0.5) / n_thres))
+			if thres == 1:
+				label = "All depths"
+			else:
+				label = f"Depth ≥ {thres}"
+			h = matplotlib.patches.Patch(
+				edgecolor=color,
+				facecolor=color[:7] + "80",
+				label=label,
+			)
+			handles.append(h)
+		figure.legend(handles=handles, loc=7, bbox_to_anchor=(0.99, 0.5),
+			fontsize=10, frameon=False, handlelength=0.75,
+		)
+
+		# save
+		for ext in params.plot_exts:
+			out_fn = f"{params.plot_basename}.{ext}"
+			figure.savefig(out_fn, dpi=600)
+		matplotlib.pyplot.close(figure)
+
+
+rule all:
+	input:
+		all_outputs,
+	default_target: True

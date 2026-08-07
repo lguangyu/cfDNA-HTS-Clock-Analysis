@@ -280,7 +280,7 @@ def _main():
 		TransfPlotCfg(
 			key="BUCCAL_TWIST",
 			file="BUCCAL_TWIST_filter_imput_transfer.age_pred.pkl",
-			plot_basename="fig_s17",
+			plot_basename="fig_s18",
 			series_cfgs=[
 				SeriesCfg(key=(0, False, False), display_name="Direct", marker="o",
 					edgecolor_override="#c0c0c0", facecolor_override="#c0c0c0",
